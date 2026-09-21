@@ -44,6 +44,7 @@ W_CAPS = 5.0
 W_PAGE = 8.0
 W_BEFORE_ABSTRACT = 10.0
 W_ABOVE_AUTHORS = 14.0
+W_COVER_ROLE = 12.0
 W_PROMINENCE = 8.0
 W_STARTS_CAPITAL = 2.0
 
@@ -102,8 +103,8 @@ def _layout_title_result(
     ranked = sorted(scored, key=lambda item: item["score"], reverse=True)
     winner = ranked[0]
     early = [item for item in ranked if int(item.get("page") or 99) <= 2]
-    if early and int(winner.get("page") or 99) > 2 and winner["score"] - early[0]["score"] < 12:
-        winner = early[0]
+    if early and int(winner.get("page") or 99) > 2:
+        winner = _prefer_early_title(winner, early)
     merged = _merge_multiline_title(winner, usable, scored)
     if _winner_looks_like_author(merged):
         replacement = next(
@@ -369,6 +370,7 @@ def _score_lines(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
     header_norms = _running_header_norms(lines)
     abstract_at = _first_marker(lines, _is_abstract_marker)
     author_at = _first_marker(lines, _looks_like_author_or_affiliation)
+    cover_at = _first_marker(lines, _is_cover_role_marker)
     iop_pages = _iop_chrome_pages(lines)
     first_page = min((int(line["page"]) for line in lines), default=1)
 
@@ -398,6 +400,7 @@ def _score_lines(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "page_bias": _page_signal(int(line["page"]), first_page),
             "before_abstract": _abstract_signal(line, abstract_at),
             "above_authors": _author_sandwich_signal(line, author_at),
+            "above_cover_role": _cover_sandwich_signal(line, cover_at),
             "prominence": _prominence_signal(line, by_page.get(line["page"], []), body_size),
             "starts_capital": W_STARTS_CAPITAL if _starts_capitalized(line["text"]) else 0.0,
         }
@@ -814,6 +817,52 @@ def _author_sandwich_signal(line: dict[str, Any], author_at: tuple[int, float] |
     return 0.0
 
 
+def _is_cover_role_marker(line: dict[str, Any]) -> bool:
+    """Student-report labels that sit directly under the real cover title."""
+    text = line.get("text") or ""
+    return bool(
+        re.match(
+            r"^(?:submitted\s+by|submitted\s+to|under\s+the\s+guidance|guided\s+by|"
+            r"prepared\s+by|presented\s+by|a\s+project\s+report|"
+            r"in\s+partial\s+fulfill?ment)\b",
+            text,
+            re.I,
+        )
+    )
+
+
+def _cover_sandwich_signal(line: dict[str, Any], cover_at: tuple[int, float] | None) -> float:
+    if not cover_at:
+        return 0.0
+    if line["page"] != cover_at[0]:
+        return 0.0
+    delta = cover_at[1] - line["y1"]
+    if 2 <= delta <= 140:
+        return W_COVER_ROLE
+    if 0 <= delta <= 220:
+        return W_COVER_ROLE * 0.5
+    return 0.0
+
+
+def _prefer_early_title(winner: dict[str, Any], early: list[dict[str, Any]]) -> dict[str, Any]:
+    """Later-page form headings (certificates, declarations) lose to a cover title."""
+    if not early:
+        return winner
+    margin = winner["score"] - early[0]["score"]
+    early_topical = [item for item in early if _looks_topical(item["text"])]
+    later_text = winner["text"]
+    later_form = (not _looks_topical(later_text)) or (
+        _mostly_all_caps(later_text) and _word_count(later_text) <= 8
+    )
+    if later_form and early_topical:
+        return early_topical[0]
+    if margin < 12:
+        return early[0]
+    if later_form and margin < 22:
+        return early_topical[0] if early_topical else early[0]
+    return winner
+
+
 def _prominence_signal(line: dict[str, Any], page_lines: list[dict[str, Any]], body_size: float) -> float:
     neighbors = sorted(page_lines, key=lambda item: item["y0"])
     try:
@@ -1042,7 +1091,17 @@ def _looks_like_sentence(text: str) -> bool:
         return True
     if re.search(r"\bI\s+\w+ed\b", text) and ":" not in text and not _mostly_title_or_caps(text):
         return True
+    # Trailing periods are common on cover titles ("… for drag reduction.").
+    # Only treat that as a sentence when it also reads like body prose.
     if words >= 12 and text_ends_with_sentence_period(text):
+        sentence_opener = bool(re.match(r"^(the|this|these|those|it|we|our|i)\s", text, re.I))
+        if sentence_opener or finite or not _looks_topical(text):
+            return True
+    if words >= 8 and re.match(r"^(the|this|these|those|it|we|our|i)\s", text, re.I) and re.search(
+        r"\b(thank|thanks|gratitude|extend|express|acknowledge)\b",
+        text,
+        re.I,
+    ):
         return True
     if words >= 12 and re.search(r"\b(comprises|which will|in order to|is used for|include a)\b", text, re.I):
         return True

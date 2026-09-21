@@ -20,6 +20,8 @@ EXACT_REJECT = {
     "bibliography",
     "acknowledgements",
     "acknowledgments",
+    "acknowledgement",
+    "acknowledgment",
     "appendix",
     "appendices",
     "methodology",
@@ -136,6 +138,28 @@ EXACT_REJECT = {
     "institute of engineering",
     "bonafide certificate",
     "certificate",
+    "certificate of approval",
+    "certificate of authenticity",
+    "certificate of originality",
+    "certificate of completion",
+    "examiner's certificate of approval",
+    "examiners certificate of approval",
+    "examiner s certificate of approval",
+    "approval sheet",
+    "approval certificate",
+    "declaration",
+    "candidate's declaration",
+    "candidates declaration",
+    "candidate s declaration",
+    "student's declaration",
+    "students declaration",
+    "declaration of the student",
+    "declaration of the candidate",
+    "sr no name",
+    "sr no",
+    "sl no",
+    "enrollment no",
+    "enrolment no",
     "archive of sid ir",
     "archive of sid.ir",
     "scientific african",
@@ -226,6 +250,50 @@ LINE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\|\s*by\s+.+\bMedium\b", _FLAGS), "medium_chrome"),
     (re.compile(r"\d{1,2}/\d{1,2}/\d{2,4}.+\bMedium\b", _FLAGS), "medium_chrome"),
     (re.compile(r"^a\s+project\s+report\b", _FLAGS), "front_matter"),
+    # Thesis / project-report form headings. Anchored so research titles that
+    # merely mention a certificate still survive.
+    (
+        re.compile(
+            r"^(?:the\s+)?"
+            r"(?:(?:internal|external|examiner'?s?|guide'?s?|supervisor'?s?|faculty|hod'?s?)\s+)?"
+            r"(?:bonafide\s+)?"
+            r"certificate"
+            r"(?:\s*of\s*(?:approval|authenticity|originality|completion|bonafides?))?"
+            r"$",
+            _FLAGS,
+        ),
+        "front_matter",
+    ),
+    (re.compile(r"^of\s+approval$", _FLAGS), "front_matter"),
+    (re.compile(r"certificateof\s*approval", _FLAGS), "front_matter"),
+    (
+        re.compile(
+            r"^(?:(?:candidate'?s?|student'?s?|author'?s?|project)\s+)?declaration"
+            r"(?:\s+of\s+the\s+(?:student|candidate|author))?$",
+            _FLAGS,
+        ),
+        "front_matter",
+    ),
+    (re.compile(r"^this\s+is\s+to\s+certify\b", _FLAGS), "front_matter"),
+    (
+        re.compile(
+            r"^(?:we|i)\s+(?:extend\s+our\s+thanks|express\s+our|would\s+like\s+to\s+thank|"
+            r"are\s+(?:highly\s+)?(?:thankful|grateful)|take\s+this\s+opportunity)",
+            _FLAGS,
+        ),
+        "acknowledgement",
+    ),
+    (re.compile(r"\b(?:sincere|heartfelt|deep)\s+(?:thanks|gratitude|appreciation)\b", _FLAGS), "acknowledgement"),
+    (re.compile(r"^kindly\s+providing\b", _FLAGS), "acknowledgement"),
+    (
+        re.compile(
+            r"^(?:s(?:r|l)?|serial)\.?\s*no\.?"
+            r"(?:\s+name(?:\s+(?:enrollment|enrolment|roll|reg(?:istration)?)\.?\s*no\.?)?)?$",
+            _FLAGS,
+        ),
+        "table_header",
+    ),
+    (re.compile(r"^(?:enrollment|enrolment|roll)\s+no\.?$", _FLAGS), "table_header"),
     (re.compile(r"^(?:project\s+)?(?:co[-\s]?)?supervisor\b", _FLAGS), "role_label"),
     (re.compile(r"^(?:internal|external)\s+(?:guide|supervisor)\b", _FLAGS), "role_label"),
     (re.compile(r"^(?:project\s+)?guide\b", _FLAGS), "role_label"),

@@ -56,9 +56,11 @@ _STATS: Counter[str] = Counter()
 
 _BAD_TITLE_RE = re.compile(
     r"^(?:table of contents|contents|abstract|chapter(?:\s+\d+)?|references|"
-    r"bibliography|acknowledg(?:e)?ments|appendix|"
+    r"bibliography|acknowledg(?:e)?ments?|appendix|"
     r"(?:chapter\s+\d+\s+)?introduction|conclusion|"
     r"list of (?:figures?|tables?|abbreviations|contents)|"
+    r"(?:examiner'?s?\s+)?certificate(?:\s+of\s+approval)?|"
+    r"declaration(?:\s+of\s+the\s+(?:student|candidate))?|"
     r"page\s*\d+|\d+)$",
     re.I,
 )
