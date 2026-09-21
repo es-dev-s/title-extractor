@@ -6,7 +6,7 @@ Flask entry point. Upload a PDF -> inspect extracted text and layout metadata.
 Extraction order:
     1. Detect whether each page has a usable native text layer
     2. Native pages: PyMuPDF dict extraction (font, bbox, page)
-    3. Scanned/garbled pages: Tesseract OCR fallback (--psm 1)
+    3. Scanned/garbled pages: Tesseract OCR fallback (fast grayscale, --psm 3)
 """
 
 import os

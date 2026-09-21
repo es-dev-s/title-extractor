@@ -3,13 +3,13 @@ Document extraction pipeline.
 
 1. Classify each page as native text, scanned, garbled, or empty.
 2. Native pages: PyMuPDF dict extraction (font + bbox metadata).
-3. Scanned/garbled pages: Tesseract OCR on the top title band only,
-   capped at ~10 seconds total.
+3. Scanned/garbled pages: Tesseract OCR at modest DPI, full page,
+   capped at ~10 seconds total (up to 3 OCR pages).
 
-Page budget: read pages until the title is high-confidence, capped at
-PRIMARY_PAGE_COUNT, then keep going only if it still is not. Scanned
-pages are the slow path, so extra OCR after a locked title is skipped.
-Gemini is a last fallback after native metadata + layout heuristics.
+Page budget: search at most the first PRIMARY_PAGE_COUNT pages. Stop
+early only when the title is high-confidence and not a weak fragment.
+If page 1 is weak, keep going through pages 2–3 (and native pages up to 7).
+Never walk the rest of a 50-page thesis looking for a title.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ import time
 from typing import Any
 
 from extractor.gemini_title import apply_gemini_layer, gemini_is_configured
-from extractor.heuristic import detect_title, is_high_confidence_title
+from extractor.heuristic import detect_title, is_high_confidence_title, is_weak_title
 from extractor.ocr import OcrUnavailableError, ocr_page, ocr_status
 from extractor.pdf_utils import (
     classify_page,
@@ -31,7 +31,7 @@ from extractor.pdf_utils import (
 
 PRIMARY_PAGE_COUNT = 7
 OCR_BUDGET_SEC = 10.0
-MAX_OCR_PAGES = 2
+MAX_OCR_PAGES = 3
 MIN_OCR_TIMEOUT_SEC = 1.5
 
 
@@ -74,27 +74,9 @@ def extract_document(
                 ocr_ctx,
             )
             title_info = _detect_from_spans(spans, page_geom, metadata, filename or pdf_path)
-            locked = is_high_confidence_title(title_info)
+            locked = is_high_confidence_title(title_info) and not is_weak_title(title_info)
             if locked:
                 break
-
-        extended = False
-        next_index = first_pass
-        while not locked and next_index < limit:
-            extended = True
-            _extract_page(
-                doc[next_index],
-                next_index + 1,
-                use_ocr,
-                spans,
-                page_reports,
-                page_geom,
-                warnings,
-                ocr_ctx,
-            )
-            next_index += 1
-            title_info = _detect_from_spans(spans, page_geom, metadata, filename or pdf_path)
-            locked = is_high_confidence_title(title_info)
 
         if title_info is None:
             title_info = _detect_from_spans(spans, page_geom, metadata, filename or pdf_path)
@@ -105,12 +87,7 @@ def extract_document(
         pdf_type = _document_type(page_reports)
         ocr_info = ocr_status()
         reason = title_info.get("reason") or ""
-        if extended:
-            reason = (
-                f"{reason} Searched pages {first_pass + 1}–{len(page_reports)} "
-                f"after the first {first_pass} were not high-confidence."
-            ).strip()
-        elif document_page_count > len(page_reports):
+        if document_page_count > len(page_reports):
             reason = (
                 f"{reason} Used the first {len(page_reports)} page(s); later pages were not needed."
             ).strip()
@@ -119,7 +96,7 @@ def extract_document(
             "pdf_type": pdf_type,
             "page_count": len(page_reports),
             "document_page_count": document_page_count,
-            "pages_extended": extended,
+            "pages_extended": False,
             "span_count": len(spans),
             "line_count": len(lines),
             "ocr_available": ocr_info["available"],

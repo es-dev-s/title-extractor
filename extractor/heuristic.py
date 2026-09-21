@@ -383,7 +383,14 @@ def _score_lines(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "font_percentile": _percentile_signal(float(line["font_size"] or 0.0), sizes, weights),
             "size_vs_body": _size_ratio_signal(float(line["font_size"] or 0.0), body_size),
             "bold": W_BOLD if line.get("bold") else 0.0,
-            "vertical": _vertical_signal(line["y_ratio"]),
+            "vertical": _vertical_signal(
+                line["y_ratio"],
+                ocr=line.get("source") == "ocr",
+                large=bool(
+                    (body_size and (line["font_size"] or 0) >= body_size * 0.98)
+                    or (line.get("source") == "ocr" and line.get("bold"))
+                ),
+            ),
             "centering": _center_signal(line["center_offset"]),
             "isolation": _isolation_signal(gaps, line["line_height"]),
             "word_count": _word_count_signal(line["word_count"]),
@@ -395,8 +402,11 @@ def _score_lines(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "starts_capital": W_STARTS_CAPITAL if _starts_capitalized(line["text"]) else 0.0,
         }
         score = sum(signals.values()) + _soft_penalties(line, abstract_at, body_size)
-        if line["word_count"] < SWEET_MIN_WORDS and (line["font_size"] or 0) < body_size * 1.35:
-            continue
+        if line["word_count"] < SWEET_MIN_WORDS:
+            size = float(line["font_size"] or 0)
+            ocr_cover = line.get("source") == "ocr" and _mostly_all_caps(line["text"]) and size >= body_size * 0.95
+            if size < body_size * 1.35 and not ocr_cover:
+                continue
         if score < 18:
             continue
         scored.append(
@@ -523,10 +533,20 @@ def _soft_penalties(line: dict[str, Any], abstract_at: tuple[int, float] | None,
     if abstract_at and _comes_after(line, abstract_at):
         penalty -= 28.0
     if line["y_ratio"] > 0.72:
-        penalty -= 12.0
+        ocr_cover = (
+            line.get("source") == "ocr"
+            and line["y_ratio"] <= 0.82
+            and (
+                (line.get("font_size") or 0) >= body_size * 0.98
+                or line.get("bold")
+            )
+        )
+        if not ocr_cover:
+            penalty -= 12.0
     size = float(line.get("font_size") or 0.0)
     if body_size and size <= body_size * 1.04:
-        penalty -= 14.0
+        if not (line.get("source") == "ocr" and (line.get("bold") or size >= body_size * 0.98)):
+            penalty -= 14.0
     if line["center_offset"] > 0.22 and size < body_size * 1.4:
         penalty -= 4.0
     if text_ends_with_sentence_period(line["text"]) and line["word_count"] > 12:
@@ -610,6 +630,8 @@ def _merge_multiline_title(
     cursor = index
     while cursor > 0:
         prev = page_lines[cursor - 1]
+        if _is_cover_particle(prev) or prev.get("norm") in bp.EXACT_REJECT or _boilerplate_reason(prev["text"]):
+            break
         allowing = _ends_incomplete(prev["text"]) or _is_title_wrap_tail(prev, chosen[0])
         if not compatible(prev, allowing_wrap=allowing) or not gap_ok(prev, chosen[0], allowing_wrap=allowing):
             break
@@ -682,8 +704,11 @@ def _size_ratio_signal(size: float, body_size: float) -> float:
     return W_SIZE_RATIO * shaped
 
 
-def _vertical_signal(y_ratio: float) -> float:
+def _vertical_signal(y_ratio: float, *, ocr: bool = False, large: bool = False) -> float:
     # Peak in the upper-middle band (journal header sits above, body below).
+    # Scanned covers often put the real title mid-page.
+    if ocr and large and y_ratio <= 0.78:
+        return W_VERTICAL * 0.85
     if y_ratio < 0.04:
         return 1.0
     if y_ratio < 0.08:
@@ -976,7 +1001,7 @@ def _looks_topical(text: str) -> bool:
             r"engine|chamber|combustion|cfd|nanofluid|radiator|compressor|axial|"
             r"cleaner|boiler|harvester|turbine|gearbox|mixer|weeder|thresher|"
             r"shredder|dryer|cutter|condenser|evaporator|muffler|impeller|"
-            r"membrane|chromium|phosphate|carrier|removal|liquid)\b",
+            r"membrane|chromium|phosphate|carrier|removal|liquid|automatic)\b",
             text,
             re.I,
         )
@@ -1204,6 +1229,20 @@ def is_high_confidence_title(result: dict[str, Any] | None) -> bool:
     return False
 
 
+def is_weak_title(result: dict[str, Any] | None) -> bool:
+    """Page-1 fragments like 'CONTROL SYSTEM' should not stop a page-2/3 search."""
+    if not result or not (result.get("title") or "").strip():
+        return True
+    text = result.get("title") or ""
+    if _word_count(text) <= 2:
+        return True
+    if _ends_incomplete(text):
+        return True
+    if "Fallback to the largest topical heading" in (result.get("reason") or ""):
+        return True
+    return False
+
+
 def _empty_result(reason: str, rejected_metadata: dict[str, Any] | None = None) -> dict[str, Any]:
     return {
         "title": None,
@@ -1327,9 +1366,16 @@ def _merge_adjacent_title_lines(lines: list[dict[str, Any]]) -> list[dict[str, A
 def _ends_incomplete(text: str) -> bool:
     """True when a title line is cut at a function word: '... parameters of'."""
     words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'-]*", text or "")
-    if not words:
+    # A lone "ON" / "OF" is cover filler, not a truncated title.
+    if len(words) < 2:
         return False
     return words[-1].lower().rstrip(".,;:") in _DANGLING_TITLE_WORDS
+
+
+def _is_cover_particle(line: dict[str, Any] | str) -> bool:
+    text = line["text"] if isinstance(line, dict) else (line or "")
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'-]*", text)
+    return len(words) == 1 and words[0].lower() in _DANGLING_TITLE_WORDS
 
 
 def _same_title_size(size_a: float, size_b: float) -> bool:
@@ -1349,7 +1395,11 @@ def _is_title_wrap_tail(prev: dict[str, Any], candidate: dict[str, Any]) -> bool
         return False
     if candidate.get("word_count", 0) > 6:
         return False
-    if prev.get("word_count", 0) < 3:
+    if prev.get("word_count", 0) < 2:
+        return False
+    if _is_cover_particle(prev) or prev.get("norm") in bp.EXACT_REJECT:
+        return False
+    if _boilerplate_reason(prev["text"]):
         return False
     if prev["text"].endswith((".", "?", "!")):
         return False
@@ -1385,6 +1435,12 @@ def _is_merge_interrupter(line: dict[str, Any]) -> bool:
 
 def _other_column(left: dict[str, Any], right: dict[str, Any]) -> bool:
     width = float(left.get("page_width") or right.get("page_width") or 0.0) or 1.0
+    overlap = min(left["y1"], right["y1"]) - max(left["y0"], right["y0"])
+    band = min(float(left.get("line_height") or 1.0), float(right.get("line_height") or 1.0))
+    gutter = max(0.0, right["x0"] - left["x1"], left["x0"] - right["x1"])
+    # OCR/cover titles are often two same-baseline chunks with a quote gap, not columns.
+    if overlap > 0.45 * max(band, 1.0) and gutter <= max(90.0, 0.16 * width):
+        return False
     left_mid = (left["x0"] + left["x1"]) / 2.0
     right_mid = (right["x0"] + right["x1"]) / 2.0
     if (left_mid < 0.46 * width and right_mid > 0.54 * width) or (
@@ -1395,13 +1451,28 @@ def _other_column(left: dict[str, Any], right: dict[str, Any]) -> bool:
     rightish = right["x0"] / width < 0.48
     if leftish == rightish:
         return False
-    overlap = min(left["y1"], right["y1"]) - max(left["y0"], right["y0"])
-    band = min(float(left.get("line_height") or 1.0), float(right.get("line_height") or 1.0))
     return overlap > 0.2 * max(band, 1.0)
 
 
 def _should_premerge(prev: dict[str, Any], candidate: dict[str, Any], buffer: list[dict[str, Any]]) -> bool:
     if prev["page"] != candidate["page"]:
+        return False
+    if _is_cover_particle(prev) or prev.get("norm") in bp.EXACT_REJECT:
+        return False
+    size_a = float(prev["font_size"] or 0.0)
+    size_b = float(candidate["font_size"] or 0.0)
+    gap = candidate["y0"] - prev["y1"]
+    cand_key = candidate["norm"]
+    # Cover pairing must run before boilerplate rejects "Project Report".
+    if (
+        prev["norm"] in {"computer networks", "electrical machine design", "electrical machines"}
+        and re.search(r"project report|final project", cand_key)
+        and size_a
+        and abs(size_a - size_b) / max(size_a, 1.0) <= 0.35
+        and gap <= 3.5 * max(prev.get("line_height") or size_a, candidate.get("line_height") or size_b, size_a)
+    ):
+        return True
+    if _boilerplate_reason(prev["text"]):
         return False
     incomplete = _ends_incomplete(prev["text"]) or _ends_incomplete(_join_title_texts(buffer))
     wrap_tail = _is_title_wrap_tail(prev, candidate)
@@ -1424,24 +1495,11 @@ def _should_premerge(prev: dict[str, Any], candidate: dict[str, Any], buffer: li
     reject = _hard_reject(candidate, set())
     if reject in {"journal_name", "institution", "garbled", "section_heading"}:
         return False
-    size_a = float(prev["font_size"] or 0.0)
-    size_b = float(candidate["font_size"] or 0.0)
     if not size_a:
         return False
-    gap = candidate["y0"] - prev["y1"]
     words = _word_count(_join_title_texts(buffer + [candidate]))
     if words > MAX_MERGED_WORDS:
         return False
-
-    # Cover pairing: only pair a known course heading with its report line.
-    cand_key = candidate["norm"]
-    if (
-        prev["norm"] in {"computer networks", "electrical machine design", "electrical machines"}
-        and re.search(r"project report|final project", cand_key)
-        and abs(size_a - size_b) / size_a <= 0.35
-        and gap <= 3.5 * max(prev["line_height"], candidate["line_height"], size_a)
-    ):
-        return True
 
     if not _same_title_size(size_a, size_b):
         return False
@@ -1462,10 +1520,10 @@ def _should_premerge(prev: dict[str, Any], candidate: dict[str, Any], buffer: li
         return True
     # Wrapped last word ("… Boost" / "Converter") is often more centered than the line above.
     if (
-        candidate["word_count"] <= 2
-        and prev["word_count"] >= 3
+        candidate["word_count"] <= 4
+        and prev["word_count"] >= 2
         and not prev["text"].endswith((".", "?", "!"))
-        and (_looks_topical(prev["text"]) or incomplete)
+        and (_looks_topical(prev["text"]) or incomplete or _mostly_all_caps(prev["text"]))
         and not re.search(r"\b[A-Z]{2,}\d{3,}/\d+", prev["text"])
     ):
         return True
@@ -1524,7 +1582,11 @@ def _fallback_document_title(
         return None
     best = max(
         candidates,
-        key=lambda item: (float(item.get("font_size") or 0.0), -float(item.get("y0") or 0.0), item["word_count"]),
+        key=lambda item: (
+            float(item.get("font_size") or 0.0),
+            item["word_count"],
+            -float(item.get("y0") or 0.0),
+        ),
     )
     return {
         "title": best["text"],

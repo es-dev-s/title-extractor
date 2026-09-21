@@ -196,10 +196,19 @@ def page1_top_text(
         page_lines = [line for line in usable if int(line.get("page") or 0) == earliest]
     if not page_lines:
         return ""
-    text = _join_gemini_lines(_top_heading_lines(page_lines, y_limit=0.30), max_chars)
-    if text:
+    text = _join_gemini_lines(_top_heading_lines(page_lines, y_limit=0.72 if _page_is_ocr(page_lines) else 0.30), max_chars)
+    if text and len(text) >= 40:
         return text
-    return _join_gemini_lines(_largest_heading_lines(page_lines), max_chars)
+    extra = _join_gemini_lines(_largest_heading_lines(page_lines), max_chars)
+    if not text:
+        return extra
+    if extra and extra not in text:
+        return (text + "\n" + extra)[:max_chars]
+    return text
+
+
+def _page_is_ocr(page_lines: list[dict[str, Any]]) -> bool:
+    return any(line.get("source") == "ocr" for line in page_lines)
 
 
 def _join_gemini_lines(chosen: list[dict[str, Any]], max_chars: int) -> str:

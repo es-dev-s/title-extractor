@@ -235,7 +235,9 @@ def spans_to_lines(spans: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "span_count": len(line_spans),
                 }
             )
+    lines = _merge_ocr_baseline_lines(lines)
     lines.sort(key=lambda item: (item["page"], item["bbox"][1], item["bbox"][0]))
+    _mark_ocr_prominence(lines)
     return lines
 
 
@@ -320,9 +322,77 @@ def _same_visual_line(span: dict[str, Any], cluster: list[dict[str, Any]]) -> bo
         # 16pt article title vs 7pt IOP "You may also like" sidebar.
         if size_gap > 0.30 and gutter > 8:
             return False
-    if gutter > 20:
+    ocr = span.get("source") == "ocr" or any(item.get("source") == "ocr" for item in cluster)
+    page_width = max(cx1, sx1, 1.0)
+    gutter_limit = max(90.0, 0.16 * page_width) if ocr else 20.0
+    if gutter > gutter_limit:
         return False
     return True
+
+
+def _merge_ocr_baseline_lines(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Join OCR title halves that sit on one baseline with a gap Tesseract treated as two lines."""
+    if len(lines) < 2:
+        return lines
+    ordered = sorted(lines, key=lambda item: (item["page"], item["bbox"][1], item["bbox"][0]))
+    merged: list[dict[str, Any]] = []
+    for line in ordered:
+        if merged and _ocr_split_title_pair(merged[-1], line):
+            merged[-1] = _combine_visual_lines(merged[-1], line)
+        else:
+            merged.append(line)
+    return merged
+
+
+def _ocr_split_title_pair(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    if int(left.get("page") or 0) != int(right.get("page") or 0):
+        return False
+    if left.get("source") != "ocr" and right.get("source") != "ocr":
+        return False
+    ly0, ly1 = left["bbox"][1], left["bbox"][3]
+    ry0, ry1 = right["bbox"][1], right["bbox"][3]
+    left_h = max(ly1 - ly0, float(left.get("font_size") or 1.0), 1.0)
+    right_h = max(ry1 - ry0, float(right.get("font_size") or 1.0), 1.0)
+    overlap = min(ly1, ry1) - max(ly0, ry0)
+    if overlap <= 0.45 * min(left_h, right_h):
+        return False
+    size_a = float(left.get("font_size") or 0.0)
+    size_b = float(right.get("font_size") or 0.0)
+    if size_a and size_b and abs(size_a - size_b) / max(size_a, size_b) > 0.18:
+        return False
+    gutter = max(0.0, right["bbox"][0] - left["bbox"][2], left["bbox"][0] - right["bbox"][2])
+    width = max(left["bbox"][2], right["bbox"][2], 1.0)
+    return gutter <= max(90.0, 0.18 * width)
+
+
+def _combine_visual_lines(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
+    combined = dict(left)
+    left_text = (left.get("text") or "").strip()
+    right_text = (right.get("text") or "").strip()
+    if left_text and right_text:
+        combined["text"] = f"{left_text} {right_text}"
+    else:
+        combined["text"] = left_text or right_text
+    combined["bbox"] = _union_bbox([left["bbox"], right["bbox"]])
+    combined["font_size"] = max(float(left.get("font_size") or 0.0), float(right.get("font_size") or 0.0))
+    combined["bold"] = bool(left.get("bold") or right.get("bold"))
+    combined["italic"] = bool(left.get("italic") or right.get("italic"))
+    combined["span_count"] = int(left.get("span_count") or 1) + int(right.get("span_count") or 1)
+    combined["source"] = "ocr" if "ocr" in {left.get("source"), right.get("source")} else left.get("source", "native")
+    return combined
+
+
+def _mark_ocr_prominence(lines: list[dict[str, Any]]) -> None:
+    """OCR has no bold flag; treat the largest cover lines as visually prominent."""
+    ocr_lines = [line for line in lines if line.get("source") == "ocr"]
+    if not ocr_lines:
+        return
+    peak = max(float(line.get("font_size") or 0.0) for line in ocr_lines)
+    if peak <= 0:
+        return
+    for line in ocr_lines:
+        if float(line.get("font_size") or 0.0) >= peak * 0.97:
+            line["bold"] = True
 
 
 def _is_bold(font_name: str, flags: int) -> bool:

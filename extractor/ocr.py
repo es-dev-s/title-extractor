@@ -1,9 +1,8 @@
 """
 Tesseract OCR fallback for scanned / garbled PDF pages.
 
-Title extraction only needs the top of the page. Rendering a grayscale
-title band at modest DPI keeps Tesseract under a few seconds instead of
-a full-page 300 DPI pass.
+Title extraction OCRs a full page at modest DPI in grayscale so Tesseract
+stays fast without clipping a cover title that sits mid-page.
 """
 
 from __future__ import annotations
@@ -19,7 +18,7 @@ Output = None
 Image = None
 
 DEFAULT_DPI = 180
-TITLE_BAND = 0.62
+TITLE_BAND = 1.0
 MAX_OCR_WIDTH = 1400
 PSM_NO_OSD = "3"
 TESSERACT_OEM = "1"
@@ -103,7 +102,7 @@ def ocr_page(
     timeout: float = OCR_TIMEOUT_SEC,
     band: float = TITLE_BAND,
 ) -> list[dict[str, Any]]:
-    """OCR the top title band of one page and return native-shaped spans."""
+    """OCR one page (full page, modest DPI) and return native-shaped spans."""
     _ensure_tesseract()
 
     rect = page.rect
@@ -173,11 +172,33 @@ def ocr_page(
 
     spans: list[dict[str, Any]] = []
     for key in sorted(grouped):
-        words = grouped[key]
+        words = sorted(grouped[key], key=lambda item: (item["bbox"][0], item["bbox"][1]))
         median_height = _median([word["font_size"] for word in words])
-        for word in words:
-            word["font_size"] = median_height
-            spans.append(word)
+        text = " ".join(word["text"] for word in words if word["text"]).strip()
+        if not text:
+            continue
+        boxes = [word["bbox"] for word in words]
+        confs = [float(word.get("confidence") or 0.0) for word in words]
+        spans.append(
+            {
+                "text": text,
+                "page": page_number,
+                "font_name": "ocr",
+                "font_size": median_height,
+                "bold": False,
+                "italic": False,
+                "bbox": [
+                    min(box[0] for box in boxes),
+                    min(box[1] for box in boxes),
+                    max(box[2] for box in boxes),
+                    max(box[3] for box in boxes),
+                ],
+                "block": key[0],
+                "line": key[2],
+                "source": "ocr",
+                "confidence": round(sum(confs) / max(len(confs), 1), 1),
+            }
+        )
     return spans
 
 
