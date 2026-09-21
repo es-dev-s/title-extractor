@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Titlextractor</title>
+  <style>
+    :root {
+      --bg: #f6f7f9;
+      --card: #ffffff;
+      --ink: #1f2933;
+      --muted: #5c6b7a;
+      --line: #d9e0e7;
+      --accent: #1f4f8a;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: system-ui, sans-serif;
+      color: var(--ink);
+      background: var(--bg);
+      margin: 0;
+      padding: 32px 20px 64px;
+    }
+    main { max-width: 1100px; margin: 0 auto; }
+    h1 { font-size: 1.5rem; margin: 0 0 6px; }
+    .lede { color: var(--muted); margin: 0 0 24px; }
+    form {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 16px;
+    }
+    button {
+      background: var(--accent);
+      color: white;
+      border: 0;
+      border-radius: 6px;
+      padding: 8px 16px;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.6; cursor: wait; }
+    .error {
+      margin-top: 16px;
+      padding: 14px 16px;
+      border-radius: 8px;
+      background: #fdecea;
+      color: #8a1f11;
+      display: none;
+    }
+    .hidden { display: none !important; }
+    #results { margin-top: 24px; }
+    .meta {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-bottom: 16px;
+    }
+    .chip {
+      background: #e8eef6;
+      color: #1f4f8a;
+      border-radius: 999px;
+      padding: 4px 10px;
+      font-size: 0.85rem;
+    }
+    .chip.ok { background: #e3f6ea; color: #146c2e; }
+    .title-card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 18px 18px 14px;
+      margin-bottom: 16px;
+    }
+    .title-card .label {
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+    .title-card .title-text {
+      font-size: 1.35rem;
+      line-height: 1.35;
+      margin: 0 0 10px;
+    }
+    .signals { font-size: 0.8rem; color: var(--muted); }
+    section {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 16px;
+      margin-bottom: 16px;
+    }
+    section h2 { font-size: 1rem; margin: 0 0 12px; }
+    .pages { font-size: 0.9rem; color: var(--muted); }
+    pre {
+      white-space: pre-wrap;
+      word-break: break-word;
+      background: #0f1720;
+      color: #e7eef7;
+      border-radius: 8px;
+      padding: 14px;
+      max-height: 420px;
+      overflow: auto;
+      margin: 0;
+      font-size: 0.86rem;
+      line-height: 1.45;
+    }
+    .table-wrap { max-height: 420px; overflow: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.84rem; }
+    th, td { border-bottom: 1px solid var(--line); padding: 6px 8px; text-align: left; vertical-align: top; }
+    th { position: sticky; top: 0; background: #f3f6fa; }
+    td.mono { font-family: ui-monospace, Consolas, monospace; white-space: nowrap; }
+    .note { color: var(--muted); font-size: 0.85rem; margin: 8px 0 0; }
+    details { margin-top: 8px; }
+    .gemini-block { margin-bottom: 12px; }
+    .gemini-block .label {
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
+    .gemini-title { font-size: 1.05rem; margin: 0 0 8px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Titlextractor</h1>
+    <p class="lede">Upload a PDF to detect its title. Validated document metadata is used first; otherwise a weighted layout heuristic scores font, position, isolation, and structure.</p>
+
+    <form id="upload-form">
+      <input type="file" name="pdf" accept="application/pdf" required />
+      <button type="submit">Extract title</button>
+    </form>
+
+    <div id="error" class="error"></div>
+
+    <div id="results" class="hidden">
+      <div class="title-card" id="title-card"></div>
+      <div class="meta" id="meta"></div>
+
+      <section id="gemini-section" class="hidden">
+        <h2>Gemini</h2>
+        <div id="gemini-body"></div>
+      </section>
+
+      <section>
+        <h2>Top title candidates</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Score</th>
+                <th>Page</th>
+                <th>Size</th>
+                <th>Text</th>
+              </tr>
+            </thead>
+            <tbody id="alts"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section>
+        <h2>Extracted text</h2>
+        <pre id="text"></pre>
+      </section>
+
+      <section>
+        <h2>Candidate lines</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Page</th>
+                <th>Size</th>
+                <th>Font</th>
+                <th>Bold</th>
+                <th>BBox</th>
+                <th>Source</th>
+                <th>Text</th>
+              </tr>
+            </thead>
+            <tbody id="lines"></tbody>
+          </table>
+        </div>
+        <p class="note" id="line-note"></p>
+      </section>
+    </div>
+  </main>
+
+  <script>
+    const form = document.getElementById("upload-form");
+    const errorBox = document.getElementById("error");
+    const results = document.getElementById("results");
+    const button = form.querySelector("button");
+    const MAX_ROWS = 400;
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      errorBox.style.display = "none";
+      results.classList.add("hidden");
+      button.disabled = true;
+      button.textContent = "Extracting...";
+
+      try {
+        const response = await fetch("/extract", { method: "POST", body: new FormData(form) });
+        const data = await response.json();
+        if (!response.ok || data.error) {
+          throw new Error(data.error || "Extraction failed");
+        }
+        render(data);
+      } catch (err) {
+        errorBox.style.display = "block";
+        errorBox.textContent = err.message;
+      } finally {
+        button.disabled = false;
+        button.textContent = "Extract title";
+      }
+    });
+
+    function render(data) {
+      const signals = data.title_signals || {};
+      const signalBits = Object.entries(signals)
+        .filter(([, value]) => Number(value))
+        .sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]))
+        .map(([key, value]) => `${key} ${Number(value).toFixed(1)}`)
+        .join(" · ");
+      const rejected = data.rejected_metadata && data.rejected_metadata.reason && data.rejected_metadata.reason !== "empty"
+        ? `<p class="note">Ignored /Title metadata (${escapeHtml(data.rejected_metadata.reason)}): ${escapeHtml(data.rejected_metadata.title || "")}</p>`
+        : "";
+      document.getElementById("title-card").innerHTML = `
+        <div class="label">Detected title</div>
+        <p class="title-text">${escapeHtml(data.title || "Could not confidently identify a title.")}</p>
+        <div class="meta">
+          ${chip(data.title_source || "none")}
+          ${chip(`confidence: ${data.title_confidence || "low"}`, data.title_confidence !== "high")}
+          ${data.title_score != null ? chip(`score ${Number(data.title_score).toFixed(1)}`) : ""}
+          ${data.title_confidence_01 != null ? chip(`p=${Number(data.title_confidence_01).toFixed(2)}`) : ""}
+          ${data.title_page ? chip(`page ${data.title_page}`) : ""}
+        </div>
+        <p class="note">${escapeHtml(data.title_reason || "")}</p>
+        ${signalBits ? `<p class="signals">${escapeHtml(signalBits)}</p>` : ""}
+        ${rejected}
+      `;
+
+      const chips = [
+        chip(String(data.pdf_type || "").toUpperCase()),
+        chip(data.document_page_count && data.document_page_count !== data.page_count
+          ? `${data.page_count} of ${data.document_page_count} pages`
+          : `${data.page_count} pages`),
+        data.pages_extended ? chip("searched extra pages") : null,
+        chip(`${data.line_count} lines`),
+        chip(`${data.span_count} spans`),
+        chip(data.ocr_available ? "Tesseract ready" : (data.ocr_reason ? `Tesseract not found (${data.ocr_reason})` : "Tesseract not found"), !data.ocr_available),
+        data.gemini_configured ? chip(`Gemini ${data.gemini_mode || "ready"}`) : chip("Gemini key missing", true),
+      ].filter(Boolean);
+      if (data.filename) chips.unshift(chip(data.filename));
+      (data.warnings || []).forEach((warning) => chips.push(chip(warning, true)));
+      document.getElementById("meta").innerHTML = chips.join("");
+
+      const alts = data.title_alternatives || [];
+      document.getElementById("alts").innerHTML = alts.length
+        ? alts.map((item) => `
+            <tr>
+              <td>${Number(item.score).toFixed(1)}</td>
+              <td>${item.page}</td>
+              <td>${item.font_size}</td>
+              <td>${escapeHtml(item.text)}</td>
+            </tr>`).join("")
+        : `<tr><td colspan="4">${data.title_source === "metadata" ? "Metadata title used — layout scoring skipped." : "No layout candidates."}</td></tr>`;
+
+      const geminiSection = document.getElementById("gemini-section");
+      const geminiRan = data.gemini_used || ["verify", "extract", "verify+extract", "error", "unavailable"].includes(data.gemini_mode);
+      if (geminiRan) {
+        const mode = data.gemini_mode || "unknown";
+        const geminiTitle = data.gemini_title || "";
+        const verifyNote = data.gemini_is_correct === true
+          ? " — Gemini said the heuristic title is correct"
+          : data.gemini_is_correct === false
+            ? (geminiTitle ? " — Gemini corrected the heuristic title" : " — Gemini rejected the candidate")
+            : "";
+        geminiSection.classList.remove("hidden");
+        document.getElementById("gemini-body").innerHTML = `
+          <p class="note">Mode: ${escapeHtml(mode)}${verifyNote}</p>
+          ${data.gemini_candidate ? `<div class="gemini-block"><div class="label">Heuristic candidate sent</div><p class="gemini-title">${escapeHtml(data.gemini_candidate)}</p></div>` : ""}
+          <div class="gemini-block">
+            <div class="label">Title returned by Gemini</div>
+            <p class="gemini-title">${escapeHtml(geminiTitle || "(none)")}</p>
+          </div>
+          <div class="gemini-block">
+            <div class="label">Text sent to Gemini (title page, top 30%, max 800 chars)</div>
+            <pre>${escapeHtml(data.gemini_input_text || "(empty)")}</pre>
+          </div>
+        `;
+      } else {
+        geminiSection.classList.add("hidden");
+        document.getElementById("gemini-body").innerHTML = "";
+      }
+
+      document.getElementById("text").textContent = data.text || "(no text extracted)";
+
+      const lines = data.lines || [];
+      const shown = lines.slice(0, MAX_ROWS);
+      document.getElementById("lines").innerHTML = shown.map((line) => `
+        <tr>
+          <td>${line.page}</td>
+          <td>${line.font_size}</td>
+          <td>${escapeHtml(line.font_name || "")}</td>
+          <td>${line.bold ? "yes" : ""}</td>
+          <td class="mono">${(line.bbox || []).join(", ")}</td>
+          <td>${line.source}</td>
+          <td>${escapeHtml(line.text)}</td>
+        </tr>
+      `).join("");
+      document.getElementById("line-note").textContent =
+        lines.length > MAX_ROWS
+          ? `Showing first ${MAX_ROWS} of ${lines.length} lines.`
+          : `${lines.length} lines with font, position, and source metadata.`;
+
+      results.classList.remove("hidden");
+    }
+
+    function chip(label, warn = false) {
+      return `<span class="chip${warn ? " warn" : ""}">${escapeHtml(label)}</span>`;
+    }
+
+    function escapeHtml(value) {
+      return String(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;");
+    }
+  </script>
+</body>
+</html>
