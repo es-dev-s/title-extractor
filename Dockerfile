@@ -21,5 +21,4 @@ ENV PYTHONUNBUFFERED=1 \
     TESSERACT_CMD=/usr/bin/tesseract
 
 EXPOSE 5000
-
-CMD ["gunicorn", "-c", "gunicorn.conf.py", "app:app"]
+CMD ["sh", "-c", "gunicorn -c gunicorn.conf.py --bind 0.0.0.0:${PORT:-5000} app:app"]
