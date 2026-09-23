@@ -11,14 +11,18 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py gunicorn.conf.py ./
+COPY app.py gunicorn.conf.py entrypoint.py ./
 COPY extractor ./extractor
 COPY templates ./templates
 
+# Local default. A hosted platform injects PORT at runtime and that value wins.
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PORT=5000 \
-    TESSERACT_CMD=/usr/bin/tesseract
+    TESSERACT_CMD=/usr/bin/tesseract \
+    FORWARDED_ALLOW_IPS=*
 
 EXPOSE 5000
-CMD ["sh", "-c", "gunicorn -c gunicorn.conf.py --bind 0.0.0.0:${PORT:-5000} app:app"]
+
+# python then exec's gunicorn, so gunicorn is PID 1 and the bind is explicit.
+ENTRYPOINT ["python", "/app/entrypoint.py"]

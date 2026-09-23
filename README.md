@@ -35,7 +35,16 @@ From this folder, with Gemini keys in `extractor/.env`:
 docker compose up -d --build
 ```
 
-The container listens on port 5000 and runs Gunicorn, not the Flask debug server. Tesseract is installed in the image. Set `WEB_CONCURRENCY` to change how many PDFs are titled at once.
+The container runs Gunicorn through `entrypoint.py`, which binds `0.0.0.0:$PORT` (port 5000 unless the host sets `PORT`). After deploy, the log must show:
+
+```
+titlextractor listening on 0.0.0.0:5000
+Listening at: http://0.0.0.0:5000
+```
+
+`Listening at: http://127.0.0.1:5000` means the process is only on loopback and the public URL will return 502. On Railway, this repo includes `railway.json` so the start command is `python /app/entrypoint.py`. If a custom Start Command is set in the service UI, clear it or set it to that same line, then redeploy. Also set the public networking port to match `PORT` (or leave `PORT` to the platform default).
+
+Tesseract is installed in the image. Set `WEB_CONCURRENCY` to change how many PDFs are titled at once. `extractor/.env` is not copied into the image, so a hosted deploy also needs `GEMINI_API_KEY` (and `GEMINI_API_KEY_2`, if you use a second key) in the service environment. Health check path: `/health`.
 
 ## How a title is chosen
 
