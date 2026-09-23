@@ -44,9 +44,14 @@ def index():
     return render_template("index.html")
 
 
+@app.route("/health", methods=["GET", "HEAD"])
+def health():
+    return jsonify({"ok": True})
+
+
 @app.route("/extract", methods=["POST"])
 def extract():
-    uploaded = request.files.get("pdf")
+    uploaded = request.files.get("pdf") or request.files.get("file")
     if not uploaded or uploaded.filename == "":
         return jsonify({"error": "No PDF uploaded"}), 400
 
@@ -58,12 +63,37 @@ def extract():
         result = extract_document(temp_path, filename=uploaded.filename)
         result["filename"] = uploaded.filename
         _log_preview(result)
+        # The app only needs the heading. The debug page still gets the full
+        # layout dump. Title generation itself is unchanged.
+        if request.args.get("title_only") == "1":
+            return jsonify(_title_only(result))
         return jsonify(result)
     except Exception as exc:
         return jsonify({"error": f"Could not read PDF: {exc}"}), 400
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
+
+
+def _title_only(result: dict) -> dict:
+    title = result.get("title")
+    if isinstance(title, str):
+        title = title.strip() or None
+    else:
+        title = None
+    source = result.get("title_source")
+    pdf_type = result.get("pdf_type") or ""
+    payload = {
+        "ok": title is not None,
+        "title": title,
+        "title_source": source,
+        "filename": result.get("filename"),
+        "method": source or pdf_type or None,
+    }
+    if title is None and pdf_type == "scanned" and not result.get("ocr_available"):
+        payload["ok"] = False
+        payload["message"] = "No OCR"
+    return payload
 
 
 def _safe_print(text: str) -> None:
@@ -83,8 +113,9 @@ def _log_preview(result: dict) -> None:
         _safe_print(
             f"[extract] {result.get('filename')} | type={result['pdf_type']} | "
             f"title={result.get('title')!r} | source={result.get('title_source')} | "
-            f"confidence={result.get('title_confidence')} | score={result.get('title_score')} | "
+            f"confidence={result.get('title_confidence')} | "
             f"gemini={result.get('gemini_mode')} | "
+            f"chars={result.get('front_text_chars')} sent={result.get('gemini_input_chars')} | "
             f"pages={result.get('page_count')}/{result.get('document_page_count')}"
             f"{' extended' if result.get('pages_extended') else ''}"
         )

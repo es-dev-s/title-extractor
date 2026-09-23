@@ -129,7 +129,7 @@
 <body>
   <main>
     <h1>Titlextractor</h1>
-    <p class="lede">Upload a PDF to detect its title. Validated document metadata is used first; otherwise a weighted layout heuristic scores font, position, isolation, and structure.</p>
+    <p class="lede">Upload a PDF to detect its title. Native text and OCR from the first few pages are sent directly to Gemini.</p>
 
     <form id="upload-form">
       <input type="file" name="pdf" accept="application/pdf" required />
@@ -148,15 +148,16 @@
       </section>
 
       <section>
-        <h2>Top title candidates</h2>
+        <h2>First-page text counts</h2>
         <div class="table-wrap">
           <table>
             <thead>
               <tr>
-                <th>Score</th>
                 <th>Page</th>
-                <th>Size</th>
-                <th>Text</th>
+                <th>Kind</th>
+                <th>Method</th>
+                <th>Extracted</th>
+                <th>Sent (top 40%)</th>
               </tr>
             </thead>
             <tbody id="alts"></tbody>
@@ -170,7 +171,7 @@
       </section>
 
       <section>
-        <h2>Candidate lines</h2>
+        <h2>Extracted lines</h2>
         <div class="table-wrap">
           <table>
             <thead>
@@ -252,47 +253,52 @@
         chip(data.document_page_count && data.document_page_count !== data.page_count
           ? `${data.page_count} of ${data.document_page_count} pages`
           : `${data.page_count} pages`),
-        data.pages_extended ? chip("searched extra pages") : null,
+        data.pages_extended ? chip("searched extra pages (5–7)") : null,
         chip(`${data.line_count} lines`),
         chip(`${data.span_count} spans`),
+        data.front_text_chars != null ? chip(`${data.front_text_chars} extracted chars`) : null,
+        data.gemini_input_chars ? chip(`${data.gemini_input_chars} chars sent to Gemini`) : null,
         chip(data.ocr_available ? "Tesseract ready" : (data.ocr_reason ? `Tesseract not found (${data.ocr_reason})` : "Tesseract not found"), !data.ocr_available),
-        data.gemini_configured ? chip(`Gemini ${data.gemini_mode || "ready"}`) : chip("Gemini key missing", true),
+        data.gemini_configured
+          ? chip(`Gemini ${data.gemini_mode || "ready"}${data.gemini_key_count ? ` ${data.gemini_keys_remaining ?? 0}/${data.gemini_key_count} keys` : ""}`)
+          : chip("Gemini key missing", true),
       ].filter(Boolean);
       if (data.filename) chips.unshift(chip(data.filename));
       (data.warnings || []).forEach((warning) => chips.push(chip(warning, true)));
       document.getElementById("meta").innerHTML = chips.join("");
 
-      const alts = data.title_alternatives || [];
-      document.getElementById("alts").innerHTML = alts.length
-        ? alts.map((item) => `
+      const counts = data.page_char_counts || data.pages || [];
+      document.getElementById("alts").innerHTML = counts.length
+        ? counts.map((item) => `
             <tr>
-              <td>${Number(item.score).toFixed(1)}</td>
               <td>${item.page}</td>
-              <td>${item.font_size}</td>
-              <td>${escapeHtml(item.text)}</td>
+              <td>${escapeHtml(item.kind || "")}</td>
+              <td>${escapeHtml(item.method || "")}</td>
+              <td>${item.char_count ?? 0}</td>
+              <td>${item.sent_char_count ?? 0}</td>
             </tr>`).join("")
-        : `<tr><td colspan="4">${data.title_source === "metadata" ? "Metadata title used — layout scoring skipped." : "No layout candidates."}</td></tr>`;
+        : `<tr><td colspan="5">No pages extracted.</td></tr>`;
 
       const geminiSection = document.getElementById("gemini-section");
-      const geminiRan = data.gemini_used || ["verify", "extract", "verify+extract", "error", "unavailable"].includes(data.gemini_mode);
+      const geminiRan = data.gemini_used || ["extract", "error", "unavailable", "quota_exhausted"].includes(data.gemini_mode);
       if (geminiRan) {
         const mode = data.gemini_mode || "unknown";
         const geminiTitle = data.gemini_title || "";
-        const verifyNote = data.gemini_is_correct === true
-          ? " — Gemini said the heuristic title is correct"
-          : data.gemini_is_correct === false
-            ? (geminiTitle ? " — Gemini corrected the heuristic title" : " — Gemini rejected the candidate")
+        const sentChars = data.gemini_input_chars || (data.gemini_input_text || "").length;
+        const quotaNote = data.quota_exhausted
+          ? " — all API keys out of quota, heuristic used as last fallback"
+          : data.gemini_key_used
+            ? ` — key ${escapeHtml(data.gemini_key_used)}`
             : "";
         geminiSection.classList.remove("hidden");
         document.getElementById("gemini-body").innerHTML = `
-          <p class="note">Mode: ${escapeHtml(mode)}${verifyNote}</p>
-          ${data.gemini_candidate ? `<div class="gemini-block"><div class="label">Heuristic candidate sent</div><p class="gemini-title">${escapeHtml(data.gemini_candidate)}</p></div>` : ""}
+          <p class="note">Mode: ${escapeHtml(mode)}${quotaNote} — top 40% of each extracted page sent to Gemini (${sentChars} characters)</p>
           <div class="gemini-block">
             <div class="label">Title returned by Gemini</div>
             <p class="gemini-title">${escapeHtml(geminiTitle || "(none)")}</p>
           </div>
           <div class="gemini-block">
-            <div class="label">Text sent to Gemini (title page, top 30%, max 800 chars)</div>
+            <div class="label">Text sent to Gemini (top 40% of each page)</div>
             <pre>${escapeHtml(data.gemini_input_text || "(empty)")}</pre>
           </div>
         `;

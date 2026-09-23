@@ -1,9 +1,10 @@
 """
-Gemini fallback for title verification / extraction.
+Gemini title extraction.
 
-Native metadata + layout heuristics always run first. This module is
-invoked only after that step, and is skipped when the heuristic
-confidence is already high and the candidate is not a known-bad heading.
+The pipeline extracts native/OCR text from the first few pages, then this
+module sends that text block to Gemini. Keys rotate on quota errors.
+Heuristic scoring is not used here; the pipeline may call it only after
+every Gemini key is out of quota.
 """
 
 from __future__ import annotations
@@ -13,11 +14,11 @@ import logging
 import os
 import re
 import time
+import urllib.error
+import urllib.request
 from collections import Counter
 from pathlib import Path
 from typing import Any
-
-from extractor import boilerplate as bp
 
 logger = logging.getLogger("extractor.gemini")
 
@@ -25,436 +26,354 @@ logger = logging.getLogger("extractor.gemini")
 class GeminiUnavailableError(RuntimeError):
     """SDK missing, auth failed, or no usable model."""
 
-MODEL_NAME = "gemini-flash-latest"
-# Verified against genai.list_models() generateContent flash IDs (2026-09-21).
-FALLBACK_MODELS = (
-    "gemini-flash-latest",
-    "gemini-3.8-flash",
-    "gemini-3.7-flash",
+
+class GeminiQuotaExhaustedError(GeminiUnavailableError):
+    """Every configured Gemini API key has hit quota."""
+
+
+class _KeyQuotaError(RuntimeError):
+    """This specific API key is out of quota."""
+
+
+MODEL_NAME = "gemini-3.6-flash"
+# Retired 2.0/2.5 Flash IDs 404. Stay on the current Flash SKU Google returns.
+MODEL_FALLBACKS = (
     "gemini-3.6-flash",
+    "gemini-flash-latest",
     "gemini-3.5-flash",
-    "gemini-2.5-flash",
-    "gemini-flash-lite-latest",
-    "gemini-2.5-flash-lite",
 )
-HIGH_CONFIDENCE = 0.85
-MEDIUM_CONFIDENCE = 0.4
-MAX_PAGE_CHARS = 800
+_RETIRED_MODELS = {
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-001",
+    "gemini-2.0-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-1.5-flash",
+    "gemini-1.5-pro",
+}
+MAX_FRONT_CHARS = 1800
+MAX_CHARS_PER_PAGE = 500
+# Titles sit near the top; send the upper 40% of each extracted page, not the body.
+TOP_PAGE_FRACTION = 0.40
 PLACEHOLDER_KEYS = {"", "YOUR_API_KEY_HERE", "your_api_key_here"}
-REQUEST_TIMEOUT_SEC = 25.0
-TRANSIENT_RETRIES = 2
-BACKOFF_SEC = 0.7
+GEMINI_BUDGET_SEC = 60.0
+REQUEST_TIMEOUT_SEC = 45.0
+MIN_CALL_SEC = 1.0
+# Free-tier Flash is ~10–15 RPM. Space calls so one PDF cannot dump 4–6 requests.
+MIN_CALL_INTERVAL_SEC = 6.5
+RPM_COOLDOWN_SEC = 60.0
+MAX_OUTPUT_TOKENS = 512
+# Gemini 3 Flash spends the output budget on hidden thinking. 0 keeps the title JSON as the only output.
+SPARSE_FRONT_CHARS = 120
 
 _ENV_PATHS = (
     Path(__file__).resolve().parent / ".env",
     Path(__file__).resolve().parent.parent / ".env",
 )
 _ENV_MTIMES: dict[str, float] = {}
-_CACHED_API_KEY: str | None = None
+_CACHED_KEYS: list[tuple[str, str]] = []
 _KEY_CACHE_WARM = False
+_EXHAUSTED_KEYS: set[str] = set()
+_RPM_COOLDOWN_UNTIL: dict[str, float] = {}
+_RR_INDEX = 0
+_LAST_CALL_AT = 0.0
 _STATS: Counter[str] = Counter()
+_KEY_ENV_RE = re.compile(r"^GEMINI_API_KEY(?:_(\d+))?$")
 
-_BAD_TITLE_RE = re.compile(
-    r"^(?:table of contents|contents|abstract|chapter(?:\s+\d+)?|references|"
-    r"bibliography|acknowledg(?:e)?ments?|appendix|"
-    r"(?:chapter\s+\d+\s+)?introduction|conclusion|"
-    r"list of (?:figures?|tables?|abbreviations|contents)|"
-    r"(?:examiner'?s?\s+)?certificate(?:\s+of\s+approval)?|"
-    r"declaration(?:\s+of\s+the\s+(?:student|candidate))?|"
-    r"page\s*\d+|\d+)$",
-    re.I,
-)
-_PAGE_NUMBER_RE = re.compile(r"^(?:page\s*)?\d+(?:\s*/\s*\d+)?$", re.I)
-_INTRO_TO_RE = re.compile(r"\bintroduction\s+to\s+", re.I)
-_TITLE_CUT_RE = re.compile(
-    r"(?<=[A-Za-z0-9'’])\s+(?:The|This|These|Those|That|It|We|Given)\s+",
-    re.I,
-)
-_TITLE_RULES = (
-    "- Copy a title verbatim from the page text. Do not invent or paraphrase.\n"
-    '- Bare section labels are NOT titles: "Introduction", "Chapter 1", '
-    '"Chapter 1 Introduction", "1.1 Introduction", "Abstract", "References".\n'
-    '- "Introduction" and "Introduction to …" are different. '
-    'Phrases such as "Introduction to Harvester" ARE valid titles if they appear in the block.\n'
-    '- Numbered body headings such as "5.2.2.2 MACHINE THRESHING" followed by a sentence '
-    "are NOT the document title.\n"
-    "- If the candidate is wrong, still return a corrected title copied from the block. "
-    "Only use null/empty if the block has no title-like phrase at all.\n"
+SYSTEM_PROMPT = (
+    "Extract the document's official title from the text. "
+    "Return JSON only: {\"title\":\"verbatim title\",\"page\":1,\"reason\":\"short\"}. "
+    "Copy the title from the text; do not invent or paraphrase. "
+    "Join wrapped title lines with single spaces. "
+    "Not a title by themselves: journal names, authors, affiliations, Abstract, Contents, "
+    "Certificate, Declaration, page numbers, DOIs, Research Article, "
+    "bare Introduction, or a bare 'Chapter 1' with no topic after it. "
+    "\"Introduction to …\" is a valid title if that is the work's name. "
+    "If a cover title appears before Abstract or Contents, use that and ignore later chapter headings. "
+    "If there is no cover title, a named heading is the title. "
+    "From 'CHAPTER 1: TRANSFORMER CONSTRUCTION' or a later line 'TRANSFORMER CONSTRUCTION', "
+    "return TRANSFORMER CONSTRUCTION. Drop only the 'Chapter N:' prefix; keep the topic. "
+    "Do not return an empty title when a topic heading like that is in the text. "
+    "If none, return {\"title\":\"\",\"page\":null,\"reason\":\"no title found\"}."
 )
 
 
 def apply_gemini_layer(
-    title_info: dict[str, Any],
     lines: list[dict[str, Any]],
     warnings: list[str],
+    page_reports: list[dict[str, Any]] | None = None,
+    deadline: float | None = None,
 ) -> dict[str, Any]:
-    """
-    Optionally verify or replace the heuristic title with Gemini.
-
-    Never mutates heuristic scoring. Returns a new/updated title_info dict.
-    """
-    result = dict(title_info or {})
-    candidate = (result.get("title") or "").strip() or None
-    confidence = _confidence_01(result)
-    page_text = page1_top_text(lines, title_page=result.get("page"))
-    known_bad = bool(candidate and is_known_bad_title(candidate))
-
-    result["title_confidence_01"] = round(confidence, 3)
-    result["gemini_mode"] = "skip"
-    result["gemini_used"] = False
-    result["gemini_input_text"] = None
-    result["gemini_candidate"] = None
-    result["gemini_title"] = None
-    result["gemini_stats"] = dict(_STATS)
-
-    incomplete = bool(candidate and _title_looks_incomplete(candidate))
-    if confidence >= HIGH_CONFIDENCE and candidate and not known_bad and not incomplete:
-        _record("skip")
-        result["gemini_stats"] = dict(_STATS)
-        return result
-
-    api_key = load_gemini_api_key()
-    if not api_key:
-        result["gemini_mode"] = "unavailable"
-        _record("unavailable", reason="missing_key")
-        warnings.append("Gemini skipped: set GEMINI_API_KEY in extractor/.env")
-        result["gemini_stats"] = dict(_STATS)
-        return result
+    """Send extracted front-page text to Gemini and return a title_info dict."""
+    page_counts = _page_char_counts(page_reports, lines)
+    page_text, sent_chars, sent_by_page = _front_text_block(lines, max_chars=MAX_FRONT_CHARS)
+    for item in page_counts:
+        item["sent_char_count"] = int(sent_by_page.get(int(item.get("page") or 0), 0))
+    result = _blank_title_info(page_counts, page_text, sent_chars)
 
     if not page_text.strip():
         result["gemini_mode"] = "unavailable"
         _record("unavailable", reason="empty_page_text")
-        warnings.append("Gemini skipped: no page text to send.")
+        warnings.append("Gemini skipped: no extracted text to send.")
         result["gemini_stats"] = dict(_STATS)
+        result["reason"] = "No extracted text from the first pages."
         return result
 
-    result["gemini_input_text"] = page_text
-    result["gemini_candidate"] = candidate
+    keys = load_gemini_api_keys()
+    result["gemini_key_count"] = len(keys)
+    result["gemini_keys_remaining"] = _live_key_count(keys)
+    if not keys:
+        result["gemini_mode"] = "unavailable"
+        _record("unavailable", reason="missing_key")
+        warnings.append("Gemini skipped: set GEMINI_API_KEY in extractor/.env")
+        result["gemini_stats"] = dict(_STATS)
+        result["reason"] = "Gemini API key is not configured."
+        return result
+
+    _respect_rpm_gap()
+    deadline = time.monotonic() + GEMINI_BUDGET_SEC
+    prompt = page_text
     try:
-        if candidate and confidence >= MEDIUM_CONFIDENCE:
-            updated = _verify(candidate, page_text, result, api_key)
-            if not _gemini_supplied_title(updated):
-                updated = _fill_missing_gemini_title(updated, page_text, api_key, candidate)
-        else:
-            updated = _extract(page_text, result, api_key)
-            if not _gemini_supplied_title(updated):
-                updated = _fill_missing_gemini_title(updated, page_text, api_key, candidate)
+        payload, key_name = _generate(prompt, deadline)
+    except GeminiQuotaExhaustedError as exc:
+        warnings.append(str(exc))
+        result["gemini_mode"] = "quota_exhausted"
+        result["quota_exhausted"] = True
+        result["gemini_keys_remaining"] = 0
+        _record("quota_exhausted")
+        result["gemini_stats"] = dict(_STATS)
+        result["reason"] = str(exc)
+        return result
     except GeminiUnavailableError as exc:
         warnings.append(f"Gemini unavailable: {exc}")
         result["gemini_mode"] = "unavailable"
         _record("unavailable", error=type(exc).__name__)
         result["gemini_stats"] = dict(_STATS)
+        result["reason"] = f"Gemini unavailable: {exc}"
         return result
     except Exception as exc:
         warnings.append(f"Gemini failed: {exc}")
         result["gemini_mode"] = "error"
         _record("error", error=type(exc).__name__)
         result["gemini_stats"] = dict(_STATS)
+        result["reason"] = f"Gemini failed: {exc}"
         return result
 
-    mode = updated.get("gemini_mode") or "error"
-    success = _gemini_supplied_title(updated)
-    _record(str(mode), success=success)
-    if success:
-        _record(f"{mode}_ok")
-    updated["gemini_stats"] = dict(_STATS)
-    return updated
+    title = _clean_model_title(payload.get("title"))
+    page = _clean_page(payload.get("page"))
+    model_reason = _clean_model_title(payload.get("reason")) or ""
+
+    result["gemini_used"] = True
+    result["gemini_mode"] = "extract"
+    result["gemini_title"] = title
+    result["gemini_input_text"] = page_text
+    result["gemini_key_used"] = key_name
+    result["gemini_keys_remaining"] = _live_key_count(load_gemini_api_keys())
+
+    if title:
+        result["title"] = title
+        result["source"] = "gemini"
+        result["confidence"] = "high"
+        result["page"] = page
+        result["reason"] = model_reason or "Gemini extracted the title from the top 40% of the first pages."
+        _record("extract_ok")
+    else:
+        result["reason"] = model_reason or "Gemini did not find a title in the extracted text."
+        _record("extract")
+    result["gemini_stats"] = dict(_STATS)
+    return result
+
+
+def load_gemini_api_keys() -> list[tuple[str, str]]:
+    """Return (env_name, key) pairs from GEMINI_API_KEY, GEMINI_API_KEY_2, ..."""
+    global _CACHED_KEYS, _KEY_CACHE_WARM
+    changed = _load_env_files()
+    if _KEY_CACHE_WARM and not changed:
+        return list(_CACHED_KEYS)
+
+    found: list[tuple[int, str, str]] = []
+    seen: set[str] = set()
+    for name, raw in os.environ.items():
+        match = _KEY_ENV_RE.match(name)
+        if not match:
+            continue
+        value = _clean_key(raw)
+        if not value or value in seen:
+            continue
+        suffix = match.group(1)
+        order = 1 if suffix is None else int(suffix)
+        found.append((order, name, value))
+        seen.add(value)
+
+    extra = os.environ.get("GEMINI_API_KEYS") or ""
+    for index, part in enumerate(_split_key_list(extra), start=100):
+        value = _clean_key(part)
+        if not value or value in seen:
+            continue
+        found.append((index, f"GEMINI_API_KEYS_{index}", value))
+        seen.add(value)
+
+    found.sort(key=lambda item: (item[0], item[1]))
+    _CACHED_KEYS = [(name, value) for _, name, value in found]
+    _KEY_CACHE_WARM = True
+    stale = {key for key in _EXHAUSTED_KEYS if key not in seen}
+    _EXHAUSTED_KEYS.difference_update(stale)
+    return list(_CACHED_KEYS)
 
 
 def load_gemini_api_key() -> str | None:
-    """Read .env files when they change; otherwise reuse the in-memory key."""
-    global _CACHED_API_KEY, _KEY_CACHE_WARM
-    changed = _load_env_files()
-    if _KEY_CACHE_WARM and not changed:
-        return _CACHED_API_KEY
-    key = (os.environ.get("GEMINI_API_KEY") or "").strip().strip('"').strip("'")
-    if key in PLACEHOLDER_KEYS:
-        key = ""
-    _CACHED_API_KEY = key or None
-    _KEY_CACHE_WARM = True
-    return _CACHED_API_KEY
+    keys = load_gemini_api_keys()
+    for _, value in keys:
+        if value not in _EXHAUSTED_KEYS:
+            return value
+    return keys[0][1] if keys else None
 
 
 def gemini_is_configured() -> bool:
-    return load_gemini_api_key() is not None
+    return bool(load_gemini_api_keys())
+
+
+def gemini_deadline(budget_sec: float = GEMINI_BUDGET_SEC) -> float:
+    return time.monotonic() + budget_sec
+
+
+def gemini_budget_remaining(deadline: float | None) -> float:
+    if deadline is None:
+        return GEMINI_BUDGET_SEC
+    return max(0.0, deadline - time.monotonic())
+
+
+def front_text_char_count(lines: list[dict[str, Any]]) -> int:
+    _, sent_chars, _ = _front_text_block(lines)
+    return sent_chars
 
 
 def gemini_counters() -> dict[str, int]:
     return dict(_STATS)
 
 
-def page1_top_text(
+def _blank_title_info(
+    page_counts: list[dict[str, Any]],
+    page_text: str,
+    sent_chars: int,
+) -> dict[str, Any]:
+    return {
+        "title": None,
+        "source": None,
+        "confidence": "low",
+        "score": None,
+        "page": None,
+        "reason": "",
+        "signals": {},
+        "alternatives": [],
+        "rejected_metadata": None,
+        "title_confidence_01": None,
+        "gemini_mode": "skip",
+        "gemini_used": False,
+        "gemini_input_text": page_text or None,
+        "gemini_input_chars": sent_chars,
+        "gemini_candidate": None,
+        "gemini_title": None,
+        "gemini_is_correct": None,
+        "gemini_stats": dict(_STATS),
+        "gemini_key_count": 0,
+        "gemini_keys_remaining": 0,
+        "gemini_key_used": None,
+        "quota_exhausted": False,
+        "page_char_counts": page_counts,
+        "front_text_chars": sum(int(item.get("char_count") or 0) for item in page_counts),
+    }
+
+
+def _page_char_counts(
+    page_reports: list[dict[str, Any]] | None,
     lines: list[dict[str, Any]],
-    max_chars: int = MAX_PAGE_CHARS,
-    title_page: int | None = None,
-) -> str:
+) -> list[dict[str, Any]]:
+    if page_reports:
+        return [
+            {
+                "page": int(item.get("page") or 0),
+                "char_count": int(item.get("char_count") or 0),
+                "kind": item.get("kind"),
+                "method": item.get("method"),
+            }
+            for item in page_reports
+        ]
+    counts: dict[int, int] = {}
+    for line in lines:
+        page = int(line.get("page") or 0)
+        counts[page] = counts.get(page, 0) + len(line.get("text") or "")
+    return [
+        {"page": page, "char_count": counts[page], "kind": None, "method": None}
+        for page in sorted(counts)
+    ]
+
+
+def _front_text_block(
+    lines: list[dict[str, Any]],
+    max_chars: int = MAX_FRONT_CHARS,
+    top_fraction: float = TOP_PAGE_FRACTION,
+) -> tuple[str, int, dict[int, int]]:
+    """Keep only lines whose top edge sits in the upper fraction of the page."""
     if not lines:
-        return ""
-    usable = _content_lines(lines)
-    wanted = int(title_page or 0)
-    page_lines = [line for line in usable if int(line.get("page") or 0) == wanted] if wanted else []
-    if not page_lines:
-        earliest = min(int(line.get("page") or 99) for line in usable)
-        page_lines = [line for line in usable if int(line.get("page") or 0) == earliest]
-    if not page_lines:
-        return ""
-    text = _join_gemini_lines(_top_heading_lines(page_lines, y_limit=0.72 if _page_is_ocr(page_lines) else 0.30), max_chars)
-    if text and len(text) >= 40:
-        return text
-    extra = _join_gemini_lines(_largest_heading_lines(page_lines), max_chars)
-    if not text:
-        return extra
-    if extra and extra not in text:
-        return (text + "\n" + extra)[:max_chars]
-    return text
+        return "", 0, {}
 
-
-def _page_is_ocr(page_lines: list[dict[str, Any]]) -> bool:
-    return any(line.get("source") == "ocr" for line in page_lines)
-
-
-def _join_gemini_lines(chosen: list[dict[str, Any]], max_chars: int) -> str:
-    texts = []
-    for line in chosen:
+    by_page: dict[int, list[dict[str, Any]]] = {}
+    for line in lines:
         text = (line.get("text") or "").strip()
-        if not text or _skip_gemini_line(text):
+        if not text:
             continue
-        texts.append(text)
-    return bp.normalize_space("\n".join(texts))[:max_chars]
+        by_page.setdefault(int(line.get("page") or 0), []).append(line)
 
-
-def _top_heading_lines(page_lines: list[dict[str, Any]], y_limit: float) -> list[dict[str, Any]]:
-    ordered = sorted(
-        page_lines,
-        key=lambda item: (float(item.get("y0") or _bbox_y0(item)), float(item.get("x0") or 0.0)),
-    )
-    top = [line for line in ordered if _y_ratio(line) <= y_limit]
-    if top:
-        return top
-    cutoff = max(1, int(len(ordered) * y_limit))
-    return ordered[:cutoff]
-
-
-def _largest_heading_lines(page_lines: list[dict[str, Any]], limit: int = 8) -> list[dict[str, Any]]:
-    ranked = sorted(
-        page_lines,
-        key=lambda item: (float(item.get("font_size") or 0.0), -_y_ratio(item)),
-        reverse=True,
-    )
-    picked = []
-    for line in ranked:
-        text = (line.get("text") or "").strip()
-        if not text or _skip_gemini_line(text):
+    chunks: list[str] = []
+    sent_by_page: dict[int, int] = {}
+    used = 0
+    for page_number in sorted(by_page):
+        page_lines = sorted(
+            by_page[page_number],
+            key=lambda item: (_line_y_ratio(item), _line_x0(item)),
+        )
+        top_lines = [item for item in page_lines if _line_y_ratio(item) <= top_fraction]
+        if not top_lines:
+            top_lines = page_lines[: max(1, (len(page_lines) + 1) // 2)]
+        body = "\n".join((item.get("text") or "").strip() for item in top_lines).strip()
+        if not body:
+            sent_by_page[page_number] = 0
             continue
-        if re.match(r"^[a-z]", text) and len(text.split()) >= 8:
-            continue
-        picked.append(line)
-        if len(picked) >= limit:
+        header = f"--- page {page_number} (top {int(top_fraction * 100)}%) ---\n"
+        remaining = max_chars - used
+        if remaining <= len(header):
             break
-    picked.sort(key=lambda item: (float(item.get("y0") or _bbox_y0(item)), float(item.get("x0") or 0.0)))
-    return picked
+        snippet = body[: min(len(body), remaining - len(header), MAX_CHARS_PER_PAGE)]
+        chunk = header + snippet
+        chunks.append(chunk)
+        sent_by_page[page_number] = len(snippet)
+        used += len(chunk)
+        if used >= max_chars:
+            break
+    text = "\n\n".join(chunks).strip()
+    return text, len(text), sent_by_page
 
 
-def _skip_gemini_line(text: str) -> bool:
-    if re.search(r"https?://|\bwww\.", text, re.I):
-        return True
-    first = next((char for char in text if char.isalpha()), "")
-    return bool(first.islower() and len(text.split()) >= 8)
+def _line_y_ratio(line: dict[str, Any]) -> float:
+    height = float(line.get("page_height") or 0.0) or 1.0
+    bbox = line.get("bbox") or [0, 0, 0, 0]
+    try:
+        y0 = float(bbox[1])
+    except (TypeError, IndexError, ValueError):
+        y0 = 0.0
+    return y0 / height
 
 
-def is_known_bad_title(text: str) -> bool:
-    key = bp.exact_key(text)
-    if not key:
-        return True
-    if re.search(r"\bintroduction\s+to\b", text, re.I):
-        return False
-    if key in bp.EXACT_REJECT or key in bp.GENERIC_TITLES:
-        return True
-    if _BAD_TITLE_RE.match(key) or _PAGE_NUMBER_RE.match(key):
-        return True
-    if re.fullmatch(r"[\d\s./:-]+", text.strip()):
-        return True
-    if re.match(r"^chapter(?:\s+\d+)?$", text.strip(), re.I):
-        return True
-    for pattern, _reason in bp.LINE_PATTERNS:
-        if pattern.search(text):
-            return True
-    return False
-
-
-def _gemini_supplied_title(result: dict[str, Any]) -> bool:
-    title = (result.get("gemini_title") or "").strip()
-    if not title or is_known_bad_title(title):
-        return False
-    if result.get("gemini_is_correct"):
-        return True
-    return result.get("source") == "gemini"
-
-
-def _fill_missing_gemini_title(
-    result: dict[str, Any],
-    page_text: str,
-    api_key: str,
-    candidate: str | None,
-) -> dict[str, Any]:
-    updated = dict(result)
-    updated["gemini_candidate"] = candidate
-    updated["gemini_input_text"] = page_text
-
-    local = _fallback_title_from_block(page_text)
-    if local:
-        return _apply_recovered_title(
-            updated,
-            local,
-            page_text,
-            "Recovered a verbatim 'Introduction to …' title from the page-1 block after Gemini returned none.",
-        )
-
-    if updated.get("gemini_mode") == "extract":
-        return updated
-
-    extracted = _extract(page_text, updated, api_key)
-    extracted["gemini_candidate"] = candidate
-    extracted["gemini_mode"] = "verify+extract"
-    extracted["gemini_is_correct"] = False
-    if _gemini_supplied_title(extracted):
-        return extracted
-
-    local = _fallback_title_from_block(page_text)
-    if local:
-        return _apply_recovered_title(
-            extracted,
-            local,
-            page_text,
-            "Recovered a verbatim title from the page-1 block after Gemini returned none.",
-        )
-    return extracted
-
-
-def _apply_recovered_title(
-    result: dict[str, Any],
-    title: str,
-    page_text: str,
-    reason: str,
-) -> dict[str, Any]:
-    if not title or not _appears_in_block(title, page_text) or is_known_bad_title(title):
-        return result
-    result["title"] = title
-    result["source"] = "gemini"
-    result["confidence"] = "high" if result.get("gemini_mode") in {"verify", "verify+extract"} else "medium"
-    result["gemini_title"] = title
-    result["gemini_used"] = True
-    result["reason"] = _append_reason(result.get("reason"), reason)
-    return result
-
-
-def _fallback_title_from_block(page_text: str) -> str | None:
-    """Prefer an 'Introduction to …' span over a bare Introduction heading."""
-    match = _INTRO_TO_RE.search(page_text or "")
-    if not match:
-        return None
-    rest = (page_text or "")[match.end() :]
-    rest = re.split(r"[.?!;\n]", rest, maxsplit=1)[0]
-    rest = _TITLE_CUT_RE.split(rest, maxsplit=1)[0]
-    rest = bp.normalize_space(rest).rstrip(".,;:")
-    words = rest.split()
-    if not words:
-        return None
-    title = bp.normalize_space(f"{match.group(0)} {' '.join(words[:10])}")
-    if is_known_bad_title(title) or not _appears_in_block(title, page_text):
-        return None
-    return title
-
-
-def _confidence_01(title_info: dict[str, Any]) -> float:
-    """Map existing high/medium/low labels onto 0-1 without changing heuristic weights."""
-    title = (title_info.get("title") or "").strip()
-    if not title:
+def _line_x0(line: dict[str, Any]) -> float:
+    bbox = line.get("bbox") or [0, 0, 0, 0]
+    try:
+        return float(bbox[0])
+    except (TypeError, IndexError, ValueError):
         return 0.0
-    source = title_info.get("source")
-    if source in {"metadata", "labeled"}:
-        return 1.0
-    label = title_info.get("confidence") or "low"
-    if label == "high":
-        return 0.90
-    if label == "medium":
-        return 0.62
-    return 0.20
 
 
-def _verify(candidate: str, page_text: str, title_info: dict[str, Any], api_key: str) -> dict[str, Any]:
-    payload = _generate(
-        api_key,
-        (
-            "You are checking a PDF title candidate from a layout heuristic.\n\n"
-            f"Candidate title:\n{candidate}\n\n"
-            f"Text from the top of page 1 (only use this block):\n{page_text}\n\n"
-            "Return JSON only with this shape:\n"
-            '{"is_correct": false, "corrected_title": "verbatim title from the block"}\n\n'
-            "Rules:\n"
-            "- is_correct is true if the candidate is the document title or a faithful substring of it.\n"
-            "- If false, corrected_title MUST be copied verbatim from the page text. "
-            "Do not paraphrase, translate, or invent.\n"
-            f"{_TITLE_RULES}"
-        ),
-    )
-    result = dict(title_info)
-    result["gemini_used"] = True
-    result["gemini_mode"] = "verify"
-    result["gemini_input_text"] = page_text
-    result["gemini_candidate"] = candidate
-    is_correct = bool(payload.get("is_correct")) and not is_known_bad_title(candidate)
-    corrected = _clean_model_title(payload.get("corrected_title"))
-    result["gemini_title"] = candidate if is_correct else corrected
-    result["gemini_is_correct"] = is_correct
-    if is_correct:
-        result["reason"] = _append_reason(result.get("reason"), "Gemini verified the heuristic title.")
-        return result
-    if corrected and _appears_in_block(corrected, page_text) and not is_known_bad_title(corrected):
-        result["title"] = corrected
-        result["source"] = "gemini"
-        result["confidence"] = "high"
-        result["reason"] = _append_reason(result.get("reason"), "Gemini replaced the heuristic title with a verbatim page-1 span.")
-        return result
-    result["reason"] = _append_reason(result.get("reason"), "Gemini rejected the candidate but offered no usable verbatim correction.")
-    return result
-
-
-def _extract(page_text: str, title_info: dict[str, Any], api_key: str) -> dict[str, Any]:
-    payload = _generate(
-        api_key,
-        (
-            "Extract the document title from this page-1 text.\n\n"
-            f"Text (only use this block):\n{page_text}\n\n"
-            "Return JSON only with this shape:\n"
-            '{"title": "exact substring from the block"}\n\n'
-            "Rules:\n"
-            "- Copy the title verbatim from the block. Never invent or paraphrase a title that is not present.\n"
-            f"{_TITLE_RULES}"
-            '- If no title-like phrase is present, return {"title": ""}.\n'
-        ),
-    )
-    result = dict(title_info)
-    result["gemini_used"] = True
-    result["gemini_mode"] = "extract"
-    result["gemini_input_text"] = page_text
-    result["gemini_candidate"] = title_info.get("gemini_candidate")
-    extracted = _clean_model_title(payload.get("title"))
-    result["gemini_title"] = extracted
-    if extracted and _appears_in_block(extracted, page_text) and not is_known_bad_title(extracted):
-        result["title"] = extracted
-        result["source"] = "gemini"
-        result["confidence"] = "medium"
-        result["reason"] = _append_reason(result.get("reason"), "Gemini extracted a verbatim title from the top of page 1.")
-    else:
-        result["reason"] = _append_reason(
-            result.get("reason"),
-            "Gemini extract returned nothing that literally appears in the page-1 block.",
-        )
-    return result
-
-
-def _generate(api_key: str, prompt: str) -> dict[str, Any]:
+def _generate(prompt: str, deadline: float) -> tuple[dict[str, Any], str]:
     try:
         import google.generativeai as genai
         from google.api_core import exceptions as gexc
@@ -463,75 +382,304 @@ def _generate(api_key: str, prompt: str) -> dict[str, Any]:
             "google-generativeai is not installed in this Python. Use .venv."
         ) from exc
 
-    genai.configure(api_key=api_key)
-    last_error: Exception | None = None
-    for index, model_name in enumerate(_model_candidates()):
+    chosen_keys = _ordered_live_keys()
+    if not chosen_keys:
+        raise GeminiQuotaExhaustedError(
+            "All Gemini API keys are out of quota or cooling down from rate limits."
+        )
+    last_block: Exception | None = None
+    blocked = 0
+    for key_name, api_key in chosen_keys:
+        genai.configure(api_key=api_key)
+        last_missing: Exception | None = None
         try:
-            payload = _generate_with_retries(genai, model_name, prompt)
-            if index:
-                _record("model_fallback", model=model_name)
-            return payload
-        except _permanent_model_errors(gexc) as exc:
-            last_error = exc
-            _record("model_missing", model=model_name)
+            for index, model_name in enumerate(_model_candidates()):
+                try:
+                    payload = _generate_once(api_key, gexc, model_name, prompt, deadline)
+                    if index:
+                        _record("model_fallback", model=model_name)
+                    _record("key_ok", key=key_name, model=model_name)
+                    return payload, key_name
+                except Exception as exc:
+                    if _is_missing_model(exc, gexc):
+                        last_missing = exc
+                        _record("model_missing", model=model_name)
+                        continue
+                    raise
+            raise GeminiUnavailableError(
+                "No current Gemini Flash model is available. Set GEMINI_MODEL in extractor/.env."
+            ) from last_missing
+        except _KeyQuotaError as exc:
+            last_block = exc
+            blocked += 1
+            if _is_daily_quota(exc):
+                _EXHAUSTED_KEYS.add(api_key)
+                _record("key_quota", key=key_name)
+            else:
+                _RPM_COOLDOWN_UNTIL[api_key] = time.monotonic() + RPM_COOLDOWN_SEC
+                _record("key_rpm", key=key_name)
             continue
         except _fatal_auth_errors(gexc) as exc:
-            raise GeminiUnavailableError(f"Gemini auth failed ({type(exc).__name__})") from exc
-        except Exception as exc:
-            last_error = exc
-            raise
-    if last_error:
-        raise GeminiUnavailableError(
-            f"No usable Gemini model ({type(last_error).__name__})"
-        ) from last_error
-    return {}
+            _record("key_auth", key=key_name)
+            raise GeminiUnavailableError(f"Gemini auth failed on {key_name}") from exc
+    if blocked and (_live_key_count(load_gemini_api_keys()) == 0 or blocked == len(chosen_keys)):
+        raise GeminiQuotaExhaustedError(
+            "All Gemini API keys are out of quota."
+        ) from last_block
+    raise GeminiUnavailableError("Gemini failed on every remaining key.") from last_block
 
 
-def _generate_with_retries(genai: Any, model_name: str, prompt: str) -> dict[str, Any]:
-    from google.api_core import exceptions as gexc
-
-    last_error: Exception | None = None
-    attempts = TRANSIENT_RETRIES + 1
-    for attempt in range(attempts):
-        try:
-            model = genai.GenerativeModel(
-                model_name,
-                generation_config={
-                    "temperature": 0,
-                    "response_mime_type": "application/json",
-                },
-            )
-            response = model.generate_content(
-                prompt,
-                request_options={"timeout": REQUEST_TIMEOUT_SEC},
-            )
-            raw = (getattr(response, "text", None) or "").strip()
-            return _parse_json(raw)
-        except _transient_errors(gexc) as exc:
-            last_error = exc
-            _record("retry", model=model_name, attempt=attempt + 1)
-            if attempt + 1 >= attempts:
-                break
-            time.sleep(BACKOFF_SEC * (2 ** attempt))
-        except _permanent_model_errors(gexc):
-            raise
-        except _fatal_auth_errors(gexc):
-            raise
-    assert last_error is not None
-    raise last_error
-
-
-def _transient_errors(gexc: Any) -> tuple[type[BaseException], ...]:
-    return (
-        gexc.TooManyRequests,
-        gexc.ResourceExhausted,
-        gexc.ServiceUnavailable,
-        gexc.DeadlineExceeded,
-        gexc.InternalServerError,
-        gexc.Aborted,
-        TimeoutError,
-        ConnectionError,
+def _generate_once(api_key: str, gexc: Any, model_name: str, prompt: str, deadline: float) -> dict[str, Any]:
+    timeout = _call_timeout(deadline)
+    if timeout is None:
+        raise TimeoutError("Gemini budget exhausted")
+    _mark_call_started()
+    try:
+        payload = _post_generate(api_key, model_name, prompt, timeout, thinking_budget=0)
+    except Exception as exc:
+        if not _thinking_rejected(exc):
+            _raise_api_error(exc, gexc)
+        payload = _post_without_thinking(api_key, model_name, prompt, timeout, gexc)
+    text, reason = _candidate_text(payload)
+    if text:
+        return _parse_json(text)
+    if reason in {"MAX_TOKENS", "2"}:
+        payload = _post_without_thinking(api_key, model_name, prompt, timeout, gexc, max_tokens=2048)
+        text, reason = _candidate_text(payload)
+        if text:
+            return _parse_json(text)
+    raise GeminiUnavailableError(
+        f"Gemini returned no title text (finish_reason={reason or 'empty'})."
     )
+
+
+def _post_without_thinking(
+    api_key: str,
+    model_name: str,
+    prompt: str,
+    timeout: float,
+    gexc: Any,
+    max_tokens: int = 2048,
+) -> dict[str, Any]:
+    try:
+        return _post_generate(
+            api_key,
+            model_name,
+            prompt,
+            timeout,
+            thinking_budget=None,
+            max_tokens=max_tokens,
+        )
+    except Exception as exc:
+        _raise_api_error(exc, gexc)
+        raise
+
+
+def _thinking_rejected(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "thinking" in text and ("400" in text or "invalid" in text)
+
+
+def _post_generate(
+    api_key: str,
+    model_name: str,
+    prompt: str,
+    timeout: float,
+    *,
+    thinking_budget: int | None,
+    max_tokens: int = MAX_OUTPUT_TOKENS,
+) -> dict[str, Any]:
+    generation: dict[str, Any] = {
+        "temperature": 0,
+        "maxOutputTokens": max_tokens,
+        "responseMimeType": "application/json",
+    }
+    if thinking_budget is not None:
+        generation["thinkingConfig"] = {"thinkingBudget": thinking_budget}
+    body = {
+        "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": generation,
+    }
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{model_name}:generateContent"
+    )
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "x-goog-api-key": api_key,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"{exc.code} {detail}") from exc
+    data = json.loads(raw) if raw else {}
+    return data if isinstance(data, dict) else {}
+
+
+def _candidate_text(payload: dict[str, Any]) -> tuple[str, str | None]:
+    candidates = payload.get("candidates") or []
+    if not candidates:
+        feedback = payload.get("promptFeedback") or {}
+        reason = feedback.get("blockReason") or "empty"
+        return "", str(reason)
+    candidate = candidates[0] if isinstance(candidates[0], dict) else {}
+    reason = candidate.get("finishReason")
+    parts = ((candidate.get("content") or {}).get("parts")) or []
+    texts = [
+        str(part.get("text"))
+        for part in parts
+        if isinstance(part, dict) and part.get("text") and not part.get("thought")
+    ]
+    return "\n".join(texts).strip(), None if reason is None else str(reason)
+
+
+def _raise_api_error(exc: BaseException, gexc: Any) -> None:
+    if _is_missing_model(exc, gexc):
+        raise exc
+    if _is_rpm_error(exc) or _is_quota_error(exc, gexc):
+        raise _KeyQuotaError(str(exc)) from exc
+    if isinstance(exc, _fatal_auth_errors(gexc)):
+        raise exc
+    text = str(exc).lower()
+    if " 401 " in f" {text} " or " 403 " in f" {text} " or "permission denied" in text or "unauthenticated" in text:
+        raise GeminiUnavailableError(f"Gemini auth failed ({exc})") from exc
+    raise exc
+
+
+def _primary_model() -> str:
+    name = _normalize_model((os.environ.get("GEMINI_MODEL") or "").strip() or MODEL_NAME)
+    if name in _RETIRED_MODELS:
+        return MODEL_NAME
+    return name
+
+
+def _model_candidates() -> list[str]:
+    extra = _normalize_model((os.environ.get("GEMINI_MODEL_FALLBACK") or "").strip())
+    ordered: list[str] = []
+    for name in (_primary_model(), extra, *MODEL_FALLBACKS):
+        name = _normalize_model(name)
+        if not name or name in _RETIRED_MODELS or name in ordered:
+            continue
+        ordered.append(name)
+    return ordered or [MODEL_NAME]
+
+
+def _normalize_model(name: str) -> str:
+    text = (name or "").strip()
+    if text.lower().startswith("models/"):
+        text = text[7:]
+    return text
+
+
+def _is_missing_model(exc: BaseException, gexc: Any) -> bool:
+    if isinstance(exc, _permanent_model_errors(gexc)):
+        return True
+    text = str(exc).lower()
+    return "no longer available" in text or (
+        "404" in text and "model" in text and "429" not in text
+    )
+
+
+def _respect_rpm_gap() -> None:
+    if _LAST_CALL_AT <= 0:
+        return
+    wait = MIN_CALL_INTERVAL_SEC - (time.monotonic() - _LAST_CALL_AT)
+    if wait > 0:
+        _record("rpm_wait", sec=round(wait, 2))
+        time.sleep(wait)
+
+
+def _mark_call_started() -> None:
+    global _LAST_CALL_AT
+    _LAST_CALL_AT = time.monotonic()
+
+
+def _ordered_live_keys() -> list[tuple[str, str]]:
+    global _RR_INDEX
+    now = time.monotonic()
+    live: list[tuple[str, str]] = []
+    for name, value in load_gemini_api_keys():
+        if value in _EXHAUSTED_KEYS:
+            continue
+        if _RPM_COOLDOWN_UNTIL.get(value, 0.0) > now:
+            continue
+        live.append((name, value))
+    if not live:
+        return []
+    start = _RR_INDEX % len(live)
+    _RR_INDEX = (_RR_INDEX + 1) % len(live)
+    return live[start:] + live[:start]
+
+
+def _pick_key() -> tuple[str, str] | None:
+    ordered = _ordered_live_keys()
+    return ordered[0] if ordered else None
+
+
+def _call_timeout(deadline: float) -> float | None:
+    remaining = deadline - time.monotonic()
+    if remaining < MIN_CALL_SEC:
+        return None
+    return min(REQUEST_TIMEOUT_SEC, remaining)
+
+
+def _is_daily_quota(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in (
+            "quota",
+            "resource_exhausted",
+            "resource exhausted",
+            "exceeded your current",
+        )
+    )
+
+
+def _is_rpm_error(exc: BaseException) -> bool:
+    if _is_daily_quota(exc):
+        return False
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in ("rate limit", "rate-limit", "too many requests", "requests per minute")
+    )
+
+
+def _is_quota_error(exc: BaseException, gexc: Any) -> bool:
+    if _is_daily_quota(exc):
+        return True
+    quota_types = []
+    for name in ("ResourceExhausted",):
+        kind = getattr(gexc, name, None)
+        if isinstance(kind, type):
+            quota_types.append(kind)
+    if quota_types and isinstance(exc, tuple(quota_types)):
+        return True
+    return False
+
+
+def _live_key_count(keys: list[tuple[str, str]]) -> int:
+    return sum(1 for _, value in keys if value not in _EXHAUSTED_KEYS)
+
+
+def _clean_key(raw: str) -> str:
+    value = (raw or "").strip().strip('"').strip("'")
+    return "" if value in PLACEHOLDER_KEYS else value
+
+
+def _split_key_list(raw: str) -> list[str]:
+    if not raw.strip():
+        return []
+    return [part.strip() for part in re.split(r"[,;\n]+", raw) if part.strip()]
 
 
 def _permanent_model_errors(gexc: Any) -> tuple[type[BaseException], ...]:
@@ -539,16 +687,12 @@ def _permanent_model_errors(gexc: Any) -> tuple[type[BaseException], ...]:
 
 
 def _fatal_auth_errors(gexc: Any) -> tuple[type[BaseException], ...]:
-    return (gexc.PermissionDenied, gexc.Unauthenticated, gexc.Forbidden)
-
-
-def _model_candidates() -> list[str]:
-    preferred = (os.environ.get("GEMINI_MODEL") or "").strip() or MODEL_NAME
-    ordered: list[str] = []
-    for name in (preferred, *FALLBACK_MODELS):
-        if name and name not in ordered:
-            ordered.append(name)
-    return ordered
+    kinds: list[type[BaseException]] = []
+    for name in ("PermissionDenied", "Unauthenticated", "Forbidden"):
+        kind = getattr(gexc, name, None)
+        if isinstance(kind, type):
+            kinds.append(kind)
+    return tuple(kinds)
 
 
 def _parse_json(raw: str) -> dict[str, Any]:
@@ -569,46 +713,18 @@ def _parse_json(raw: str) -> dict[str, Any]:
 def _clean_model_title(value: Any) -> str | None:
     if value is None:
         return None
-    text = bp.normalize_space(str(value))
+    text = re.sub(r"\s+", " ", str(value)).strip().strip('"').strip("'")
     if not text or text.lower() in {"null", "none", "n/a"}:
         return None
     return text
 
 
-def _appears_in_block(title: str, block: str) -> bool:
-    needle = re.sub(r"\s+", " ", title).strip().lower()
-    haystack = re.sub(r"\s+", " ", block).strip().lower()
-    if not needle or not haystack:
-        return False
-    if needle in haystack:
-        return True
-    compact_title = re.sub(r"[^a-z0-9]+", "", needle)
-    compact_block = re.sub(r"[^a-z0-9]+", "", haystack)
-    return len(compact_title) >= 8 and compact_title in compact_block
-
-
-def _append_reason(existing: str | None, extra: str) -> str:
-    existing = (existing or "").strip()
-    if not existing:
-        return extra
-    if extra in existing:
-        return existing
-    return f"{existing} {extra}"
-
-
-def _y_ratio(line: dict[str, Any]) -> float:
-    if line.get("y_ratio") is not None:
-        return float(line["y_ratio"])
-    height = float(line.get("page_height") or 0.0) or 1.0
-    return _bbox_y0(line) / height
-
-
-def _bbox_y0(line: dict[str, Any]) -> float:
-    bbox = line.get("bbox") or [0, 0, 0, 0]
+def _clean_page(value: Any) -> int | None:
     try:
-        return float(bbox[1])
-    except (TypeError, IndexError, ValueError):
-        return 0.0
+        page = int(value)
+    except (TypeError, ValueError):
+        return None
+    return page if page > 0 else None
 
 
 def _load_env_files() -> bool:
@@ -641,30 +757,6 @@ def _load_env_files() -> bool:
             if name:
                 os.environ[name] = value
     return changed
-
-
-def _content_lines(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    by_page: dict[int, list[dict[str, Any]]] = {}
-    for line in lines:
-        by_page.setdefault(int(line.get("page") or 0), []).append(line)
-    kept: list[dict[str, Any]] = []
-    for page in sorted(by_page):
-        blob = " ".join(item.get("text") or "" for item in by_page[page])
-        if bp.COVER_PAGE_RE.search(blob):
-            continue
-        kept.extend(by_page[page])
-    return kept or list(lines)
-
-
-def _title_looks_incomplete(text: str) -> bool:
-    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'-]*", text or "")
-    if not words:
-        return True
-    dangling = {
-        "a", "an", "the", "and", "or", "of", "for", "in", "on", "to", "with",
-        "by", "from", "as", "at", "using",
-    }
-    return words[-1].lower().rstrip(".,;:") in dangling
 
 
 def _record(event: str, **info: Any) -> None:
