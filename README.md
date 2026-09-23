@@ -1,9 +1,8 @@
 # Titlextractor
 
-Extracts the title from a PDF, even when it's not the biggest font on
-page 1. Two-tier pipeline: GROBID first (accurate, scholarly-trained),
-heuristic scorer as fallback (font size + position + boilerplate
-rejection).
+Reads a PDF and returns its printed title. Text comes from the PDF itself
+or from Tesseract. Gemini reads that text and names the title. The layout
+heuristic runs only after every Gemini key is out of quota.
 
 ## Setup
 
@@ -11,47 +10,50 @@ rejection).
 pip install -r requirements.txt
 ```
 
-## (Optional but recommended) Run GROBID
+Tesseract must be on `PATH` for scanned or garbled pages. Put one or more
+Gemini keys in `extractor/.env`:
 
-GROBID is what gives you near-100% accuracy on academic PDFs. It runs as
-a separate Docker container — your Flask app just calls it over HTTP.
-
-```bash
-docker run -t --rm -p 8070:8070 grobid/grobid:0.8.0
+```
+GEMINI_API_KEY=...
+GEMINI_API_KEY_2=...
 ```
 
-If you skip this step, the app still works — it just falls back straight
-to the heuristic scorer (still decent, not as strong on tricky layouts).
-
-## Run the app
+## Run
 
 ```bash
 python app.py
 ```
 
-Visit http://localhost:5000, upload a PDF, get the title back.
+Open http://localhost:5000, upload a PDF, and the page shows the title plus
+the extracted layout. `GET /health` returns `{"ok": true}`.
 
-## How it decides the title
+## Production
 
-1. **GROBID** (`extractor/grobid_client.py`) — sends the PDF to the
-   running GROBID container, parses the `<title>` out of its TEI-XML
-   response. Trained specifically on scholarly document structure, so it
-   correctly ignores journal names/DOIs/ISSN lines even when they're
-   visually similar to the real title.
-2. **Heuristic fallback** (`extractor/heuristic.py`) — only runs if
-   GROBID is unreachable or returns nothing. Extracts every text line
-   with its font size, boldness, page, and position (`extractor/pdf_utils.py`),
-   scores each one, rejects boilerplate patterns and repeated
-   headers/footers, and merges multi-line titles.
+From this folder, with Gemini keys in `extractor/.env`:
 
-## Next steps worth adding
+```bash
+docker compose up -d --build
+```
 
-- **OCR tier**: if `has_text_layer()` returns `False`, run PaddleOCR or
-  Tesseract before either tier above — the current app just reports an
-  error in that case.
-- **LLM tier**: for the cases where GROBID fails AND the heuristic score
-  is low, send the first page's raw text to an LLM asking it to return
-  the title verbatim, then verify the response is an exact substring of
-  the source text before trusting it (prevents hallucinated titles).
-- Batch mode: loop `run_pipeline()` over a folder of PDFs instead of one
-  upload at a time.
+The container listens on port 5000 and runs Gunicorn, not the Flask debug server. Tesseract is installed in the image. Set `WEB_CONCURRENCY` to change how many PDFs are titled at once.
+
+## How a title is chosen
+
+`extractor/pipeline.py` does this once per PDF:
+
+1. Classify each page as native text, scanned, garbled, or empty.
+2. Native pages: PyMuPDF reads the text with font and position (`extractor/pdf_utils.py`).
+3. Scanned or garbled pages: Tesseract OCRs the full page (`extractor/ocr.py`). At most 3 pages, about 45 seconds each.
+4. Always read the first 4 pages. If the title area is too thin, read through page 7, still as one pass.
+5. Send that front-matter text to Gemini once (`extractor/gemini_title.py`). Keys rotate when one hits quota. Gemini is not called a second time for the same PDF.
+6. If every key is out of quota, score lines by font size, position, and boilerplate rejection (`extractor/heuristic.py`) and use that heading instead.
+
+## What the app calls
+
+The PDF app posts each file to `POST /extract?title_only=1` with the form field `pdf` (or `file`). That response is only the heading:
+
+```json
+{"ok": true, "title": "...", "title_source": "gemini", "filename": "paper.pdf", "method": "gemini"}
+```
+
+`POST /extract` without `title_only` returns the same title plus pages, lines, and the text that was sent to Gemini. A scanned PDF with no Tesseract install comes back as `{"ok": false, "message": "No OCR"}`.

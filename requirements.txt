@@ -4,3 +4,5 @@ requests==2.34.2
 pytesseract==0.3.13
 Pillow==10.4.0
 google-generativeai==0.8.5
+gunicorn==26.2.0
+waitress==3.0.2
